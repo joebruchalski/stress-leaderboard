@@ -163,12 +163,15 @@ def render_trends_tab(db_path: str) -> None:
         )
 
 
-def render_people_tab(db_path: str) -> None:
+def render_leaderboard_tab(db_path: str) -> None:
+    """The primary view: who stresses you out, ranked. Everything else in
+    this dashboard (daily detail, trends, patterns, recovery) is supporting
+    detail — this tab is the headline."""
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("From", value=date.today() - timedelta(days=13), key="people_start")
+        start_date = st.date_input("From", value=date.today() - timedelta(days=89), key="leaderboard_start")
     with col2:
-        end_date = st.date_input("To", value=date.today(), key="people_end")
+        end_date = st.date_input("To", value=date.today(), key="leaderboard_end")
 
     if start_date > end_date:
         st.error("Start date must be before end date.")
@@ -198,15 +201,50 @@ def render_people_tab(db_path: str) -> None:
         st.info("No one meets that threshold in this range — lower the slider.")
         return
 
-    top_n = filtered.head(20)
-    fig = stress_core.build_person_rollup_chart(top_n)
-    st.pyplot(fig, width="stretch")
+    rank_by = st.radio(
+        "Rank by",
+        ["Average stress", "Stress increase when the meeting starts (Δ)"],
+        horizontal=True,
+        help=(
+            "Average stress: their meetings' overall stress level, which can reflect a generally "
+            "stressful day, not just them. Δ (delta): how much stress actually rose going into their "
+            "meetings vs. right before — a more causal signal, but needs enough clean before/after data."
+        ),
+    )
+    if rank_by == "Average stress":
+        ranked = filtered.sort_values("avg_stress", ascending=False)
+    else:
+        ranked = filtered.dropna(subset=["avg_delta"]).sort_values("avg_delta", ascending=False)
 
-    st.subheader("Average stress by meeting attendee")
+    if ranked.empty:
+        st.info("No one has a computable Δ in this range yet (needs clean free time right before a meeting).")
+        return
+
+    top = ranked.iloc[0]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🏆 Top stressor", top.name)
+    m2.metric("Avg stress in their meetings", f"{top['avg_stress']:.0f}")
+    m3.metric("Meetings together", f"{int(top['meetings'])}")
+
+    st.subheader("Leaderboard")
+    display = ranked.head(20).reset_index().rename(columns={"attendee_name": "Attendee"})
+    display.insert(0, "Rank", range(1, len(display) + 1))
+    display = display[["Rank", "Attendee", "meetings", "avg_stress", "peak_stress", "avg_delta"]].set_index("Rank")
+    display.columns = ["Attendee", "Meetings", "Avg stress", "Peak stress", "Δ stress (during vs. before)"]
     st.dataframe(
-        filtered.style.format({"avg_stress": "{:.1f}", "peak_stress": "{:.0f}", "total_minutes": "{:.0f}", "meetings": "{:.0f}"}),
+        display.style.format(
+            {"Meetings": "{:.0f}", "Avg stress": "{:.1f}", "Peak stress": "{:.0f}", "Δ stress (during vs. before)": "{:+.1f}"},
+            na_rep="–",
+        )
+        .background_gradient(subset=["Avg stress"], cmap="Blues", vmin=0, vmax=100)
+        .bar(subset=["Δ stress (during vs. before)"], align=0, color=["#e34948", "#2a78d6"], vmin=-30, vmax=30),
         width="stretch",
     )
+
+    with st.expander("Chart view (average stress)"):
+        fig = stress_core.build_person_rollup_chart(filtered.sort_values("avg_stress", ascending=False).head(20))
+        st.pyplot(fig, width="stretch")
+
     st.caption(
         "An event's average/peak stress applies to everyone who attended it — this shows who you're "
         "in stressful meetings WITH, not who specifically causes the stress within a group call."
@@ -312,24 +350,28 @@ def render_recovery_tab(db_path: str) -> None:
 
 
 def main() -> None:
-    st.title("Stress vs. Calendar")
+    st.title("Who's Stressing You Out")
     config = render_settings_sidebar()
     db_path = stress_core.DEFAULT_DB_PATH
     storage.init_db(db_path)
 
-    tab_daily, tab_trends, tab_people, tab_patterns, tab_recovery = st.tabs(
-        ["Daily Detail", "Trends", "By Person", "Patterns", "Recovery"]
+    # Leaderboard first — it's the headline. Patterns/Recovery are the other
+    # "why" dimensions. Daily Detail/Trends are granular supporting detail,
+    # pushed last per the user's explicit priority: "the leaderboard... the
+    # other data is more secondary."
+    tab_leaderboard, tab_patterns, tab_recovery, tab_daily, tab_trends = st.tabs(
+        ["🏆 Leaderboard", "Patterns", "Recovery", "Daily Detail", "Trends"]
     )
-    with tab_daily:
-        render_daily_tab(config, db_path)
-    with tab_trends:
-        render_trends_tab(db_path)
-    with tab_people:
-        render_people_tab(db_path)
+    with tab_leaderboard:
+        render_leaderboard_tab(db_path)
     with tab_patterns:
         render_patterns_tab(db_path)
     with tab_recovery:
         render_recovery_tab(db_path)
+    with tab_daily:
+        render_daily_tab(config, db_path)
+    with tab_trends:
+        render_trends_tab(db_path)
 
 
 if __name__ == "__main__":

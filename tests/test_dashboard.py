@@ -43,24 +43,24 @@ def test_dashboard_empty_state_renders_without_exceptions(monkeypatch, tmp_path,
     at.run(timeout=60)
 
     assert not at.exception
-    assert [t.label for t in at.tabs] == ["Daily Detail", "Trends", "By Person", "Patterns", "Recovery"]
+    assert [t.label for t in at.tabs] == ["🏆 Leaderboard", "Patterns", "Recovery", "Daily Detail", "Trends"]
 
     # Empty DB: all five tabs should show an informational empty state, not
     # crash or show stale/wrong data.
-    daily_info = " ".join(i.value for i in at.tabs[0].info)
-    assert "No stored results" in daily_info or "Fetch from Garmin" in daily_info
+    leaderboard_info = " ".join(i.value for i in at.tabs[0].info)
+    assert "No attendee data" in leaderboard_info
 
-    trends_info = " ".join(i.value for i in at.tabs[1].info)
-    assert "No stored results in this range" in trends_info
-
-    people_info = " ".join(i.value for i in at.tabs[2].info)
-    assert "No attendee data" in people_info
-
-    patterns_info = " ".join(i.value for i in at.tabs[3].info)
+    patterns_info = " ".join(i.value for i in at.tabs[1].info)
     assert "No stored results in this range" in patterns_info
 
-    recovery_info = " ".join(i.value for i in at.tabs[4].info)
+    recovery_info = " ".join(i.value for i in at.tabs[2].info)
     assert "No sleep/Body Battery data" in recovery_info
+
+    daily_info = " ".join(i.value for i in at.tabs[3].info)
+    assert "No stored results" in daily_info or "Fetch from Garmin" in daily_info
+
+    trends_info = " ".join(i.value for i in at.tabs[4].info)
+    assert "No stored results in this range" in trends_info
 
 
 def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_path, fixtures_dir):
@@ -99,33 +99,36 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
 
     assert not at.exception
 
-    # Daily Detail tab defaults to today, which now has cached data: expect
-    # metrics + a chart + a populated table, not the "no data" empty state.
-    daily_tab = at.tabs[0]
-    assert len(daily_tab.info) == 0
-    metric_labels = [m.label for m in daily_tab.metric]
-    assert "Workday average stress" in metric_labels
-    assert "Workday peak stress" in metric_labels
-    assert len(daily_tab.dataframe) == 1  # the "Stress by meeting" table
-
-    # Trends tab default range (today-13..today) includes today.
-    trends_tab = at.tabs[1]
-    assert len(trends_tab.info) == 0
-    assert len(trends_tab.dataframe) == 1  # the event rollup table
-
-    # By Person tab: two attendees, each with exactly 1 meeting here — below
+    # Leaderboard tab: two attendees, each with exactly 1 meeting here — below
     # the meetings-filter slider's min!=max requirement, so the slider must
-    # be hidden (not crash) and everyone shown unfiltered.
-    people_tab = at.tabs[2]
-    assert len(people_tab.slider) == 0
-    assert len(people_tab.dataframe) == 1
-    rendered = str(people_tab.dataframe[0].value)
+    # be hidden (not crash) and everyone shown unfiltered. Hero metric names
+    # the top stressor, and the ranked table lists both attendees.
+    leaderboard_tab = at.tabs[0]
+    assert len(leaderboard_tab.slider) == 0
+    metric_labels = [m.label for m in leaderboard_tab.metric]
+    assert "🏆 Top stressor" in metric_labels
+    assert len(leaderboard_tab.dataframe) == 1
+    rendered = str(leaderboard_tab.dataframe[0].value)
     assert "Alice Anderson" in rendered and "Bob Brown" in rendered
 
     # Patterns tab default range (today-13..today) includes today's data, so
     # both charts should render without falling back to the empty state.
-    patterns_tab = at.tabs[3]
+    patterns_tab = at.tabs[1]
     assert len(patterns_tab.info) == 0
+
+    # Daily Detail tab defaults to today, which now has cached data: expect
+    # metrics + a chart + a populated table, not the "no data" empty state.
+    daily_tab = at.tabs[3]
+    assert len(daily_tab.info) == 0
+    daily_metric_labels = [m.label for m in daily_tab.metric]
+    assert "Workday average stress" in daily_metric_labels
+    assert "Workday peak stress" in daily_metric_labels
+    assert len(daily_tab.dataframe) == 1  # the "Stress by meeting" table
+
+    # Trends tab default range (today-13..today) includes today.
+    trends_tab = at.tabs[4]
+    assert len(trends_tab.info) == 0
+    assert len(trends_tab.dataframe) == 1  # the event rollup table
 
 
 def test_dashboard_recovery_tab_renders_scatter_charts_when_populated(monkeypatch, tmp_path, fixtures_dir):
@@ -153,7 +156,7 @@ def test_dashboard_recovery_tab_renders_scatter_charts_when_populated(monkeypatc
     at.run(timeout=60)
 
     assert not at.exception
-    recovery_tab = at.tabs[4]
+    recovery_tab = at.tabs[2]
     assert len(recovery_tab.info) == 0  # populated, not the empty state
     # st.pyplot() renders as an Image element in AppTest's element tree.
     assert len(recovery_tab.image) == 2  # sleep-score scatter + Body Battery scatter
@@ -182,13 +185,13 @@ def test_dashboard_recovery_tab_partial_data_shows_info_not_exception(monkeypatc
     at.run(timeout=60)
 
     assert not at.exception
-    recovery_tab = at.tabs[4]
+    recovery_tab = at.tabs[2]
     assert len(recovery_tab.image) == 1  # only the sleep-score chart
     battery_info = " ".join(i.value for i in recovery_tab.info)
     assert "No overlapping Body Battery" in battery_info
 
 
-def test_dashboard_people_tab_slider_filters_by_meeting_count(monkeypatch, tmp_path, fixtures_dir):
+def test_dashboard_leaderboard_slider_filters_by_meeting_count(monkeypatch, tmp_path, fixtures_dir):
     """Once someone has 2+ meetings in range, the meetings-filter slider
     must appear (unlike the single-meeting case, where it's hidden to avoid
     Streamlit's min_value==max_value crash), and it must actually filter out
@@ -216,15 +219,15 @@ def test_dashboard_people_tab_slider_filters_by_meeting_count(monkeypatch, tmp_p
     at.run(timeout=60)
 
     assert not at.exception
-    people_tab = at.tabs[2]
-    assert len(people_tab.slider) == 1
-    slider = people_tab.slider[0]
+    leaderboard_tab = at.tabs[0]
+    assert len(leaderboard_tab.slider) == 1
+    slider = leaderboard_tab.slider[0]
     assert slider.min == 1
     assert slider.max == 2
     assert slider.value == 2  # defaults to min(2, max_meetings)
 
     # At the default threshold (2), Zoe's single meeting doesn't qualify.
-    rendered_default = str(people_tab.dataframe[0].value)
+    rendered_default = str(leaderboard_tab.dataframe[0].value)
     assert "Alice Anderson" in rendered_default
     assert "Zoe Zimmer" not in rendered_default
 
@@ -232,6 +235,6 @@ def test_dashboard_people_tab_slider_filters_by_meeting_count(monkeypatch, tmp_p
     slider.set_value(1)
     at.run(timeout=60)
     assert not at.exception
-    rendered_all = str(at.tabs[2].dataframe[0].value)
+    rendered_all = str(at.tabs[0].dataframe[0].value)
     assert "Alice Anderson" in rendered_all
     assert "Zoe Zimmer" in rendered_all
