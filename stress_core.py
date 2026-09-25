@@ -17,6 +17,7 @@ import garminconnect
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
 import recurring_ical_events
 from icalendar import Calendar
 from tzlocal import get_localzone
@@ -580,6 +581,103 @@ def build_daily_chart(grid: pd.DataFrame, events: list[dict], target_date: date)
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, frameon=False)
     fig.tight_layout()
+    return fig
+
+
+def build_daily_chart_interactive(grid: pd.DataFrame, events: list[dict], target_date: date) -> go.Figure:
+    """Interactive (Plotly) counterpart to build_daily_chart(), used only by
+    the dashboard's Daily Detail tab (st.plotly_chart). build_daily_chart()
+    itself is untouched — stress_analyzer.py (the CLI) still calls it to
+    save a static PNG, and that export path must keep working.
+
+    hovermode="x unified" means the pointer only has to be near a time on
+    the x-axis, not pixel-precise on the line, to see that minute's exact
+    local time, stress value, and which meeting (or "No Meeting") owns it —
+    directly answering "was I in a meeting when this spike happened?".
+    Meeting shading is drawn with add_vrect() (the Plotly analog of
+    axvspan()); since vrect shapes don't hover or appear in a legend on
+    their own, per-meeting identity comes from two places: the "Meeting"
+    line in the unified hover tooltip (sourced from grid["event"] via
+    customdata on the stress trace) and a real always-visible legend built
+    from invisible marker traces, one per meeting — per the dataviz skill's
+    ">=2 series always gets a legend, not hover-only identification" rule.
+    """
+    color_map = build_event_color_map(events)
+    day_start, day_end = grid["timestamp_local"].iloc[0], grid["timestamp_local"].iloc[-1]
+
+    fig = go.Figure()
+
+    plotted_labels: set[str] = set()
+    for event in events:
+        span_start = max(event["start"], day_start)
+        span_end = min(event["end"], day_end)
+        if span_start >= span_end:
+            continue
+        fig.add_vrect(
+            x0=span_start,
+            x1=span_end,
+            fillcolor=color_map[event["title"]],
+            opacity=0.28,
+            line_width=0,
+            layer="below",
+        )
+        if event["title"] not in plotted_labels:
+            plotted_labels.add(event["title"])
+            fig.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="markers",
+                    marker=dict(size=10, symbol="square", color=color_map[event["title"]]),
+                    name=event["title"],
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+
+    fig.add_trace(
+        go.Scatter(
+            x=grid["timestamp_local"],
+            y=grid["stress"],
+            mode="lines",
+            line=dict(color=STRESS_LINE_COLOR, width=2, shape="linear"),
+            name="Stress level",
+            customdata=grid["event"],
+            hovertemplate="Stress: %{y:.0f}<br>Meeting: %{customdata}<extra></extra>",
+            connectgaps=False,
+        )
+    )
+
+    fig.update_layout(
+        title=f"Stress vs. Calendar Events — {target_date.isoformat()}",
+        hovermode="x unified",
+        xaxis=dict(
+            title="Time",
+            type="date",  # explicit: the invisible x=[None] legend-marker
+            # traces (added before the real datetime trace, so the legend
+            # order matches build_daily_chart's) otherwise make Plotly's
+            # axis-type autodetection fall back to linear/category and drop
+            # the real timestamps entirely.
+            tickformat="%I:%M %p",
+            hoverformat="%I:%M %p",
+            showgrid=False,
+            showline=True,
+            linecolor="#e1e0d9",
+        ),
+        yaxis=dict(
+            title="Stress level (0-100)",
+            range=[0, 100],
+            gridcolor="#e1e0d9",
+            zeroline=False,
+            showline=True,
+            linecolor="#e1e0d9",
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02, font=dict(size=11)),
+        margin=dict(l=60, r=160, t=60, b=50),
+        height=520,
+    )
     return fig
 
 
