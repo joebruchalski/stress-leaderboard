@@ -202,3 +202,137 @@ def test_load_person_rollup_empty_range_returns_empty_frame(db_path):
     storage.init_db(db_path)
     rollup = storage.load_person_rollup(db_path, date(2099, 1, 1), date(2099, 1, 2))
     assert rollup.empty
+
+
+# --------------------------------------------------------------------------
+# load_stress_by_weekday / load_stress_by_hour
+# --------------------------------------------------------------------------
+
+def _single_hour_grid(target_date, tz, hour, minute, stress_values):
+    timestamps = pd.date_range(
+        datetime.combine(target_date, time(hour, minute), tzinfo=tz),
+        periods=len(stress_values),
+        freq="1min",
+    )
+    return pd.DataFrame(
+        {"timestamp_local": timestamps, "stress": stress_values, "event": ["No Meeting"] * len(stress_values)}
+    )
+
+
+def test_load_stress_by_weekday_groups_correctly(db_path):
+    """Synthetic data spanning three different weekdays (deliberately saved
+    out of calendar order — Wed, Mon, Tue — to also prove the returned index
+    is reordered Monday..Sunday, not insertion order)."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    monday = date(2024, 1, 15)  # 2024-01-15 is a Monday
+    tuesday = date(2024, 1, 16)
+    wednesday = date(2024, 1, 17)
+
+    grid_wed = _single_hour_grid(wednesday, tz, 9, 0, [50.0, 60.0])
+    storage.save_day(db_path, wednesday, grid_wed, stress_core.summarize_by_event(grid_wed))
+
+    grid_mon = _single_hour_grid(monday, tz, 9, 0, [10.0, 20.0])
+    storage.save_day(db_path, monday, grid_mon, stress_core.summarize_by_event(grid_mon))
+
+    grid_tue = _single_hour_grid(tuesday, tz, 9, 0, [80.0, 90.0])
+    storage.save_day(db_path, tuesday, grid_tue, stress_core.summarize_by_event(grid_tue))
+
+    by_weekday = storage.load_stress_by_weekday(db_path, monday, wednesday)
+
+    assert list(by_weekday.index) == ["Monday", "Tuesday", "Wednesday"]
+    assert by_weekday.loc["Monday", "avg_stress"] == pytest.approx(15.0)
+    assert by_weekday.loc["Tuesday", "avg_stress"] == pytest.approx(85.0)
+    assert by_weekday.loc["Wednesday", "avg_stress"] == pytest.approx(55.0)
+    assert by_weekday.loc["Monday", "peak_stress"] == 20.0
+    assert by_weekday.loc["Monday", "minutes"] == 2
+
+
+def test_load_stress_by_weekday_combines_same_weekday_across_weeks(db_path):
+    """Two different Mondays a week apart must aggregate into one 'Monday'
+    row, minute-weighted (a plain mean of the two days' averages, since both
+    days contribute the same minute count here)."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    monday1 = date(2024, 1, 15)
+    monday2 = date(2024, 1, 22)
+    grid1 = _single_hour_grid(monday1, tz, 9, 0, [10.0, 20.0])
+    storage.save_day(db_path, monday1, grid1, stress_core.summarize_by_event(grid1))
+    grid2 = _single_hour_grid(monday2, tz, 9, 0, [30.0, 40.0])
+    storage.save_day(db_path, monday2, grid2, stress_core.summarize_by_event(grid2))
+
+    by_weekday = storage.load_stress_by_weekday(db_path, monday1, monday2)
+    assert list(by_weekday.index) == ["Monday"]
+    assert by_weekday.loc["Monday", "avg_stress"] == pytest.approx(25.0)  # mean of all 4 minutes
+    assert by_weekday.loc["Monday", "minutes"] == 4
+
+
+def test_load_stress_by_weekday_excludes_null_stress_minutes(db_path):
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    monday = date(2024, 1, 15)
+    grid = pd.DataFrame(
+        {
+            "timestamp_local": pd.date_range(datetime.combine(monday, time(9, 0), tzinfo=tz), periods=2, freq="1min"),
+            "stress": [40.0, None],
+            "event": ["No Meeting", "No Meeting"],
+        }
+    )
+    storage.save_day(db_path, monday, grid, stress_core.summarize_by_event(grid))
+
+    by_weekday = storage.load_stress_by_weekday(db_path, monday, monday)
+    assert by_weekday.loc["Monday", "minutes"] == 1
+    assert by_weekday.loc["Monday", "avg_stress"] == pytest.approx(40.0)
+
+
+def test_load_stress_by_weekday_empty_range_returns_empty_frame(db_path):
+    storage.init_db(db_path)
+    by_weekday = storage.load_stress_by_weekday(db_path, date(2099, 1, 1), date(2099, 1, 2))
+    assert by_weekday.empty
+
+
+def test_load_stress_by_hour_groups_correctly(db_path):
+    """Synthetic data spanning several hours of day within a single day."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    day = date(2024, 1, 15)
+
+    grid_9am = _single_hour_grid(day, tz, 9, 0, [10.0, 20.0])
+    grid_2pm = _single_hour_grid(day, tz, 14, 0, [80.0, 100.0])
+    combined = pd.concat([grid_9am, grid_2pm], ignore_index=True)
+    storage.save_day(db_path, day, combined, stress_core.summarize_by_event(combined))
+
+    by_hour = storage.load_stress_by_hour(db_path, day, day)
+
+    assert list(by_hour.index) == [9, 14]  # ascending, not insertion order
+    assert by_hour.loc[9, "avg_stress"] == pytest.approx(15.0)
+    assert by_hour.loc[14, "avg_stress"] == pytest.approx(90.0)
+    assert by_hour.loc[14, "peak_stress"] == 100.0
+    assert by_hour.loc[9, "minutes"] == 2
+
+
+def test_load_stress_by_hour_aggregates_same_hour_across_days(db_path):
+    """The same hour-of-day on two different dates must combine into one row."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    day1 = date(2024, 1, 15)
+    grid1 = _single_hour_grid(day1, tz, 9, 0, [10.0, 20.0])
+    storage.save_day(db_path, day1, grid1, stress_core.summarize_by_event(grid1))
+
+    day2 = date(2024, 1, 16)
+    grid2 = _single_hour_grid(day2, tz, 9, 0, [50.0, 60.0])
+    storage.save_day(db_path, day2, grid2, stress_core.summarize_by_event(grid2))
+
+    by_hour = storage.load_stress_by_hour(db_path, day1, day2)
+    assert list(by_hour.index) == [9]
+    assert by_hour.loc[9, "avg_stress"] == pytest.approx(35.0)
+    assert by_hour.loc[9, "minutes"] == 4
+
+
+def test_load_stress_by_hour_empty_range_returns_empty_frame(db_path):
+    storage.init_db(db_path)
+    by_hour = storage.load_stress_by_hour(db_path, date(2099, 1, 1), date(2099, 1, 2))
+    assert by_hour.empty

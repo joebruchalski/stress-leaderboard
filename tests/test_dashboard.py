@@ -43,9 +43,9 @@ def test_dashboard_empty_state_renders_without_exceptions(monkeypatch, tmp_path,
     at.run(timeout=60)
 
     assert not at.exception
-    assert [t.label for t in at.tabs] == ["Daily Detail", "Trends", "By Person"]
+    assert [t.label for t in at.tabs] == ["Daily Detail", "Trends", "By Person", "Patterns"]
 
-    # Empty DB: all three tabs should show an informational empty state, not
+    # Empty DB: all four tabs should show an informational empty state, not
     # crash or show stale/wrong data.
     daily_info = " ".join(i.value for i in at.tabs[0].info)
     assert "No stored results" in daily_info or "Fetch from Garmin" in daily_info
@@ -55,6 +55,9 @@ def test_dashboard_empty_state_renders_without_exceptions(monkeypatch, tmp_path,
 
     people_info = " ".join(i.value for i in at.tabs[2].info)
     assert "No attendee data" in people_info
+
+    patterns_info = " ".join(i.value for i in at.tabs[3].info)
+    assert "No stored results in this range" in patterns_info
 
 
 def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_path, fixtures_dir):
@@ -115,6 +118,11 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     assert len(people_tab.dataframe) == 1
     rendered = str(people_tab.dataframe[0].value)
     assert "Alice Anderson" in rendered and "Bob Brown" in rendered
+
+    # Patterns tab default range (today-13..today) includes today's data, so
+    # both charts should render without falling back to the empty state.
+    patterns_tab = at.tabs[3]
+    assert len(patterns_tab.info) == 0
 
 
 def test_dashboard_people_tab_slider_filters_by_meeting_count(monkeypatch, tmp_path, fixtures_dir):

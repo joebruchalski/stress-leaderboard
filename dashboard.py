@@ -210,19 +210,49 @@ def render_people_tab(db_path: str) -> None:
     )
 
 
+def render_patterns_tab(db_path: str) -> None:
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("From", value=date.today() - timedelta(days=13), key="patterns_start")
+    with col2:
+        end_date = st.date_input("To", value=date.today(), key="patterns_end")
+
+    if start_date > end_date:
+        st.error("Start date must be before end date.")
+        return
+
+    by_weekday = storage.load_stress_by_weekday(db_path, start_date, end_date)
+    st.subheader("By day of week")
+    if by_weekday.empty:
+        st.info("No stored results in this range yet. Run some daily analyses first (Daily Detail tab, or the automated job).")
+    else:
+        fig = stress_core.build_weekday_chart(by_weekday)
+        st.pyplot(fig, width="stretch")
+
+    by_hour = storage.load_stress_by_hour(db_path, start_date, end_date)
+    st.subheader("By time of day")
+    if by_hour.empty:
+        st.info("No stored results in this range yet. Run some daily analyses first (Daily Detail tab, or the automated job).")
+    else:
+        fig = stress_core.build_hourly_chart(by_hour)
+        st.pyplot(fig, width="stretch")
+
+
 def main() -> None:
     st.title("Stress vs. Calendar")
     config = render_settings_sidebar()
     db_path = stress_core.DEFAULT_DB_PATH
     storage.init_db(db_path)
 
-    tab_daily, tab_trends, tab_people = st.tabs(["Daily Detail", "Trends", "By Person"])
+    tab_daily, tab_trends, tab_people, tab_patterns = st.tabs(["Daily Detail", "Trends", "By Person", "Patterns"])
     with tab_daily:
         render_daily_tab(config, db_path)
     with tab_trends:
         render_trends_tab(db_path)
     with tab_people:
         render_people_tab(db_path)
+    with tab_patterns:
+        render_patterns_tab(db_path)
 
 
 if __name__ == "__main__":
