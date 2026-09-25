@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import stress_core
@@ -109,7 +109,73 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=None, help="Output PNG path (default: stress_report_YYYY-MM-DD.png)")
     parser.add_argument("--db", type=str, default=stress_core.DEFAULT_DB_PATH, help="SQLite history database path")
     parser.add_argument("--setup", action="store_true", help="Run the one-time setup wizard and exit")
+    parser.add_argument(
+        "--backfill-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Analyze the last N days (today back through N-1 days ago) in one run instead of a "
+            "single --date. Skips dates already in the database (use --force-refresh to redo them "
+            "anyway) and keeps going past per-day failures (e.g. a day with no synced Garmin data) "
+            "instead of aborting the whole batch. Useful for pre-loading history before a demo, so "
+            "the dashboard doesn't need any live Garmin calls while you're showing it to someone."
+        ),
+    )
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="With --backfill-days, re-fetch dates that already have stored results instead of skipping them.",
+    )
     return parser.parse_args()
+
+
+def run_single_day(config: dict, target_date: date, db_path: str, output_path: Path | None, save_chart: bool) -> None:
+    """Analyze one day, print the summary, persist to the DB, and optionally
+    save a PNG chart. Raises ConfigError/ValueError on failure — the caller
+    decides whether that's fatal (single-day mode) or just skip-and-continue
+    (backfill mode)."""
+    grid, events = stress_core.run_analysis(config, target_date)
+    print(stress_core.format_summary_text(grid, target_date))
+
+    storage.init_db(db_path)
+    event_summary = stress_core.summarize_by_event(grid)
+    storage.save_day(db_path, target_date, grid, event_summary, events)
+    print(f"\nResults saved to: {db_path}")
+
+    if save_chart:
+        chart_path = output_path or Path(f"stress_report_{target_date.isoformat()}.png")
+        fig = stress_core.build_daily_chart(grid, events, target_date)
+        fig.savefig(chart_path, dpi=150)
+        print(f"Chart saved to: {chart_path}")
+
+
+def run_backfill(config: dict, days: int, db_path: str, force_refresh: bool) -> None:
+    """Analyze the last `days` days, one at a time, never letting one bad day
+    (no synced Garmin data, a transient error) abort the rest of the batch —
+    this is meant to be run well ahead of a live demo so the dashboard can
+    run entirely off stored data with zero live Garmin calls in the room."""
+    storage.init_db(db_path)
+    results: list[tuple[date, str]] = []
+
+    for offset in range(days):
+        target_date = date.today() - timedelta(days=offset)
+        if not force_refresh and storage.has_day(db_path, target_date):
+            print(f"{target_date.isoformat()}: already have results, skipping (use --force-refresh to redo)")
+            results.append((target_date, "skipped (cached)"))
+            continue
+
+        print(f"\n{'=' * 60}\n{target_date.isoformat()}\n{'=' * 60}")
+        try:
+            run_single_day(config, target_date, db_path, output_path=None, save_chart=False)
+            results.append((target_date, "ok"))
+        except (ConfigError, ValueError) as exc:
+            print(f"  -> skipped: {exc}")
+            results.append((target_date, f"failed: {exc}"))
+
+    print(f"\n{'=' * 60}\nBackfill summary ({days} days)\n{'=' * 60}")
+    for target_date, status in results:
+        print(f"  {target_date.isoformat()}: {status}")
 
 
 def main() -> None:
@@ -128,22 +194,14 @@ def main() -> None:
             "Missing configuration for a non-interactive run. Run 'python3 stress_analyzer.py --setup' first."
         )
 
+    if args.backfill_days is not None:
+        run_backfill(config, args.backfill_days, args.db, args.force_refresh)
+        return
+
     try:
-        grid, events = stress_core.run_analysis(config, args.date)
+        run_single_day(config, args.date, args.db, args.output, save_chart=True)
     except (ConfigError, ValueError) as exc:
         sys.exit(str(exc))
-
-    print(stress_core.format_summary_text(grid, args.date))
-
-    storage.init_db(args.db)
-    event_summary = stress_core.summarize_by_event(grid)
-    storage.save_day(args.db, args.date, grid, event_summary, events)
-    print(f"\nResults saved to: {args.db}")
-
-    output_path = args.output or Path(f"stress_report_{args.date.isoformat()}.png")
-    fig = stress_core.build_daily_chart(grid, events, args.date)
-    fig.savefig(output_path, dpi=150)
-    print(f"Chart saved to: {output_path}")
 
 
 if __name__ == "__main__":
