@@ -464,7 +464,8 @@ def build_person_rollup_chart(rollup: pd.DataFrame) -> plt.Figure:
     ax.set_xlim(0, 100)
     ax.set_xlabel("Average stress level (0-100)")
     ax.set_title("Average Stress by Meeting Attendee")
-    ax.grid(axis="x", color="#e1e0d9", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)  # zorder=0 on grid() alone doesn't reliably sit behind bar patches
+    ax.grid(axis="x", color="#e1e0d9", linewidth=0.8)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()
