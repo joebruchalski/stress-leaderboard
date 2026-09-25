@@ -33,6 +33,16 @@ def render_settings_popover() -> dict:
         with st.form("settings_form", clear_on_submit=False):
             email = st.text_input("Garmin Connect email", value=config["email"])
             ics_path = st.text_input("Path to .ics calendar file", value=config["ics_path"])
+            ics_url = st.text_input(
+                "Live calendar URL (optional — overrides the local .ics file if set)",
+                value=config.get("ics_url", ""),
+                help=(
+                    "Your calendar provider's private/secret iCal address (Google Calendar, "
+                    "Outlook, or iCloud all offer one). When set, this is fetched live instead "
+                    "of reading the local .ics file above; if a fetch ever fails, the last "
+                    "successfully-fetched calendar is used instead, with a warning."
+                ),
+            )
             calendar_email = st.text_input(
                 "Your own email as it appears in meeting invites",
                 value=config["calendar_email"],
@@ -57,7 +67,12 @@ def render_settings_popover() -> dict:
                 st.error(f"File not found: {ics_path}")
             else:
                 stress_core.save_config(
-                    email, str(Path(ics_path).expanduser()), config["tokenstore"], calendar_email, internal_domain
+                    email,
+                    str(Path(ics_path).expanduser()),
+                    config["tokenstore"],
+                    calendar_email,
+                    internal_domain,
+                    ics_url.strip(),
                 )
                 if password:
                     stress_core.save_keychain_password(email, password)
