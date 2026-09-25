@@ -450,6 +450,52 @@ def build_trend_chart(daily_summary: pd.DataFrame) -> plt.Figure:
     return fig
 
 
+def build_weekday_chart(by_weekday: pd.DataFrame) -> plt.Figure:
+    """Vertical bar chart of average stress by day of week. This ranks ONE
+    measure (avg_stress) across ordered categories (Monday..Sunday) rather
+    than by identity, so — like build_person_rollup_chart — it uses a single
+    sequential hue instead of the categorical event palette. Unlike the
+    person rollup, the categories have a natural order (the calendar week),
+    so bars are NOT re-sorted by magnitude. `by_weekday` must be indexed by
+    weekday name in Monday..Sunday order with an avg_stress column (see
+    storage.load_stress_by_weekday)."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(by_weekday.index, by_weekday["avg_stress"], color=STRESS_LINE_COLOR, width=0.6)
+
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Average stress level (0-100)")
+    ax.set_xlabel("Day of week")
+    ax.set_title("Average Stress by Day of Week")
+    ax.set_axisbelow(True)  # zorder=0 on grid() alone doesn't reliably sit behind bar patches
+    ax.grid(axis="y", color="#e1e0d9", linewidth=0.8)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+def build_hourly_chart(by_hour: pd.DataFrame) -> plt.Figure:
+    """Vertical bar chart of average stress by hour of day. Same magnitude-
+    across-ordered-categories job as build_weekday_chart: single sequential
+    hue, natural (chronological) ordering, no re-sort by magnitude.
+    `by_hour` must be indexed by hour-of-day (int), sorted ascending, with
+    an avg_stress column (see storage.load_stress_by_hour)."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    labels = [f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}" for h in by_hour.index]
+    ax.bar(labels, by_hour["avg_stress"], color=STRESS_LINE_COLOR, width=0.6)
+
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Average stress level (0-100)")
+    ax.set_xlabel("Hour of day")
+    ax.set_title("Average Stress by Time of Day")
+    ax.set_axisbelow(True)  # zorder=0 on grid() alone doesn't reliably sit behind bar patches
+    ax.grid(axis="y", color="#e1e0d9", linewidth=0.8)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
 def build_person_rollup_chart(rollup: pd.DataFrame) -> plt.Figure:
     """Horizontal ranked bar chart of average stress by meeting attendee.
     This ranks ONE measure across many categories (a magnitude job), so it

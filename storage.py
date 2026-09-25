@@ -206,6 +206,50 @@ def load_event_rollup(db_path: str, start_date: date, end_date: date) -> pd.Data
     return grouped.drop(columns="weighted_avg").sort_values("avg_stress", ascending=False)
 
 
+WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def load_stress_by_weekday(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Average/peak stress grouped by day of week, across a date range.
+    Weekday is derived in pandas from the `date` column (an ISO string) via
+    date.fromisoformat(...).weekday() rather than SQLite's own date
+    functions, for consistency with how the rest of this module treats
+    dates as plain ISO strings. Returned index is weekday name, ordered
+    Monday..Sunday (only weekdays present in the data appear)."""
+    with _connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT date, stress FROM stress_minutes WHERE date BETWEEN ? AND ? AND stress IS NOT NULL",
+            conn,
+            params=(start_date.isoformat(), end_date.isoformat()),
+        )
+    if df.empty:
+        return df
+
+    df["weekday"] = df["date"].apply(lambda d: WEEKDAY_LABELS[date.fromisoformat(d).weekday()])
+    grouped = df.groupby("weekday")["stress"].agg(avg_stress="mean", peak_stress="max", minutes="count")
+    grouped = grouped.reindex([w for w in WEEKDAY_LABELS if w in grouped.index])
+    return grouped
+
+
+def load_stress_by_hour(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Average/peak stress grouped by hour of day, across a date range.
+    Hour is parsed from `timestamp_local` (local time already, per
+    stress_minutes' storage convention) via .dt.hour. Returned index is
+    hour-of-day (int, e.g. 9..16), sorted ascending."""
+    with _connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT timestamp_local, stress FROM stress_minutes WHERE date BETWEEN ? AND ? AND stress IS NOT NULL",
+            conn,
+            params=(start_date.isoformat(), end_date.isoformat()),
+        )
+    if df.empty:
+        return df
+
+    df["hour"] = pd.to_datetime(df["timestamp_local"]).dt.hour
+    grouped = df.groupby("hour")["stress"].agg(avg_stress="mean", peak_stress="max", minutes="count")
+    return grouped.sort_index()
+
+
 def load_person_rollup(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:
     """Average/peak stress per meeting attendee across a date range, weighted
     by minutes. Note: an event's full avg/peak/minutes apply to every
