@@ -817,3 +817,58 @@ def build_recovery_scatter_chart(df: pd.DataFrame, x_col: str, x_label: str, tit
     fig.update_yaxes(title_text="Workday average stress (0-100)", range=[0, 100])
     _style_plotly_figure(fig, show_legend=False)
     return fig
+
+
+def build_person_history_chart(history: pd.DataFrame, person_name: str) -> go.Figure:
+    """Interactive line chart of one attendee's stress across every stored
+    meeting occurrence with them, in chronological order — the Leaderboard's
+    "drill into one person" view. Mirrors build_trend_chart's line+markers /
+    hover / axis-tick conventions so interactive charts read as one system
+    across the dashboard: STRESS_LINE_COLOR for the primary series, a dashed
+    secondary line for peak, hovermode="x unified", a real legend (not
+    hover-only — two series), and _style_plotly_figure()'s shared white
+    surface / recessive-grid look.
+
+    `history` must have columns date (str, ISO), event, avg_stress,
+    peak_stress — one row per meeting occurrence, already ordered
+    chronologically (see storage.load_person_history()). Multiple meetings
+    on the same date are plotted at the same x position, distinguished by
+    the event name in the hover tooltip."""
+    dates_parsed = pd.to_datetime(history["date"])
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=dates_parsed,
+            y=history["avg_stress"],
+            mode="lines+markers",
+            name="Avg stress (per meeting)",
+            line=dict(color=STRESS_LINE_COLOR, width=2),
+            marker=dict(size=6),
+            customdata=history["event"],
+            hovertemplate="%{customdata}<br>Avg stress: %{y:.1f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates_parsed,
+            y=history["peak_stress"],
+            mode="lines+markers",
+            name="Peak stress (per meeting)",
+            line=dict(color=EVENT_COLORS[1], width=1.5, dash="dash"),
+            marker=dict(size=5),
+            customdata=history["event"],
+            hovertemplate="%{customdata}<br>Peak stress: %{y:.0f}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title=f"{person_name} — Stress Across Meetings Over Time",
+        hovermode="x unified",
+    )
+    span_days = max((dates_parsed.max() - dates_parsed.min()).days, 0) if not history.empty else 0
+    day_step = max(1, round(span_days / 8)) if span_days else 1
+    fig.update_xaxes(title_text="Date", tickformat="%b %-d", dtick=day_step * 86_400_000)
+    fig.update_yaxes(title_text="Stress level (0-100)", range=[0, 100])
+    _style_plotly_figure(fig)
+    return fig

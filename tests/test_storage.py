@@ -438,3 +438,184 @@ def test_load_person_rollup_avg_delta_weights_across_multiple_days(db_path):
     assert rollup.loc["Alice Anderson", "avg_delta"] == pytest.approx(10.0)
     # avg_stress keeps its existing (unrelated) weighting behavior.
     assert rollup.loc["Alice Anderson", "avg_stress"] == pytest.approx(65.0)
+
+
+def test_load_person_rollup_keeps_attendee_email_column(db_path):
+    """attendee_email must survive as a real column, not just the (discarded)
+    groupby key — callers (e.g. the dashboard's drill-down selection) need
+    it as the stable identity key alongside the display-name index."""
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)
+    events = _sample_events(target_date, tz)
+    storage.init_db(db_path)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid), events)
+
+    rollup = storage.load_person_rollup(db_path, target_date, target_date)
+    assert rollup.loc["Alice Anderson", "attendee_email"] == "alice@example.com"
+    assert rollup.loc["Bob Brown", "attendee_email"] == "bob@example.com"
+
+
+# --------------------------------------------------------------------------
+# load_person_trend: first-half vs. second-half stress trend per attendee
+# --------------------------------------------------------------------------
+
+def _flat_grid(day, tz, stress_value, event_title="Sync", minutes=2):
+    timestamps = pd.date_range(
+        datetime.combine(day, time(9, 0), tzinfo=tz),
+        periods=minutes,
+        freq="1min",
+    )
+    return pd.DataFrame(
+        {
+            "timestamp_local": timestamps,
+            "stress": [stress_value] * minutes,
+            "event": [event_title] * minutes,
+        }
+    )
+
+
+def _attendee_event(grid, email, name, event_title="Sync"):
+    ts = grid["timestamp_local"]
+    return [
+        {
+            "title": event_title,
+            "start": ts.iloc[0],
+            "end": ts.iloc[-1] + pd.Timedelta(minutes=1),
+            "attendees": [{"email": email, "name": name}],
+        }
+    ]
+
+
+def test_load_person_trend_insufficient_data_returns_nan(db_path):
+    """Only 1 meeting in each half of the range — below the minimum of 2
+    per half — so trend must be NaN, not a number computed from too little
+    data. avg_stress/meetings must still be correct (insufficient-data only
+    disables the trend column, not the whole row)."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    start, end = date(2024, 1, 1), date(2024, 1, 20)  # midpoint: Jan 11
+
+    day1 = date(2024, 1, 2)  # first half
+    grid1 = _flat_grid(day1, tz, 80.0)
+    storage.save_day(
+        db_path, day1, grid1, stress_core.summarize_by_event(grid1), _attendee_event(grid1, "alice@example.com", "Alice A")
+    )
+
+    day2 = date(2024, 1, 12)  # second half
+    grid2 = _flat_grid(day2, tz, 20.0)
+    storage.save_day(
+        db_path, day2, grid2, stress_core.summarize_by_event(grid2), _attendee_event(grid2, "alice@example.com", "Alice A")
+    )
+
+    trend = storage.load_person_trend(db_path, start, end)
+    row = trend.loc["Alice A"]
+    assert row["first_half_meetings"] == 1
+    assert row["second_half_meetings"] == 1
+    assert pd.isna(row["trend"])
+    # Overall aggregate is still correct even though trend is uncomputable.
+    assert row["meetings"] == 2
+    assert row["avg_stress"] == pytest.approx(50.0)
+
+
+def test_load_person_trend_computes_improving_and_worsening_trends(db_path):
+    """Multi-person, multi-date correctness: Alice's stress drops from the
+    first half to the second (improving -> negative trend), Bob's rises
+    (worsening -> positive trend). Each half is minutes-weighted, mirroring
+    load_person_rollup's existing weighting convention."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    start, end = date(2024, 1, 1), date(2024, 1, 20)  # midpoint: Jan 11
+
+    # Alice: 80 -> 80 (first half, 2 meetings) then 20 -> 20 (second half, 2 meetings).
+    for day in (date(2024, 1, 2), date(2024, 1, 4)):
+        grid = _flat_grid(day, tz, 80.0)
+        storage.save_day(
+            db_path, day, grid, stress_core.summarize_by_event(grid), _attendee_event(grid, "alice@example.com", "Alice A")
+        )
+    for day in (date(2024, 1, 12), date(2024, 1, 15)):
+        grid = _flat_grid(day, tz, 20.0)
+        storage.save_day(
+            db_path, day, grid, stress_core.summarize_by_event(grid), _attendee_event(grid, "alice@example.com", "Alice A")
+        )
+
+    # Bob: 20 -> 20 (first half) then 80 -> 80 (second half) — the reverse.
+    for day in (date(2024, 1, 3), date(2024, 1, 5)):
+        grid = _flat_grid(day, tz, 20.0)
+        storage.save_day(
+            db_path, day, grid, stress_core.summarize_by_event(grid), _attendee_event(grid, "bob@example.com", "Bob B")
+        )
+    for day in (date(2024, 1, 13), date(2024, 1, 16)):
+        grid = _flat_grid(day, tz, 80.0)
+        storage.save_day(
+            db_path, day, grid, stress_core.summarize_by_event(grid), _attendee_event(grid, "bob@example.com", "Bob B")
+        )
+
+    trend = storage.load_person_trend(db_path, start, end)
+
+    alice = trend.loc["Alice A"]
+    assert alice["first_half_avg"] == pytest.approx(80.0)
+    assert alice["second_half_avg"] == pytest.approx(20.0)
+    assert alice["trend"] == pytest.approx(-60.0)  # improving
+
+    bob = trend.loc["Bob B"]
+    assert bob["first_half_avg"] == pytest.approx(20.0)
+    assert bob["second_half_avg"] == pytest.approx(80.0)
+    assert bob["trend"] == pytest.approx(60.0)  # worsening
+
+
+def test_load_person_trend_empty_range_returns_empty_frame(db_path):
+    storage.init_db(db_path)
+    trend = storage.load_person_trend(db_path, date(2099, 1, 1), date(2099, 1, 2))
+    assert trend.empty
+
+
+# --------------------------------------------------------------------------
+# load_person_history: one attendee's meeting occurrences over time
+# --------------------------------------------------------------------------
+
+def test_load_person_history_returns_chronological_occurrences_for_one_attendee(db_path):
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    # Same person, but their display name varies in capitalization across
+    # occurrences (e.g. calendar invite formatting drift) — email is the
+    # stable join key, per the docstring, so both occurrences must still
+    # come back.
+    day1 = date(2024, 1, 5)
+    grid1 = _flat_grid(day1, tz, 30.0, event_title="1:1")
+    storage.save_day(
+        db_path, day1, grid1, stress_core.summarize_by_event(grid1),
+        _attendee_event(grid1, "alice@example.com", "alice anderson", event_title="1:1"),
+    )
+
+    day2 = date(2024, 1, 10)
+    grid2 = _flat_grid(day2, tz, 70.0, event_title="Planning")
+    storage.save_day(
+        db_path, day2, grid2, stress_core.summarize_by_event(grid2),
+        _attendee_event(grid2, "alice@example.com", "Alice Anderson", event_title="Planning"),
+    )
+
+    # An unrelated attendee in the same range must not leak into Alice's history.
+    day3 = date(2024, 1, 7)
+    grid3 = _flat_grid(day3, tz, 90.0, event_title="Standup")
+    storage.save_day(
+        db_path, day3, grid3, stress_core.summarize_by_event(grid3),
+        _attendee_event(grid3, "carol@example.com", "Carol Chen", event_title="Standup"),
+    )
+
+    history = storage.load_person_history(db_path, "alice@example.com", date(2024, 1, 1), date(2024, 1, 20))
+    assert list(history["date"]) == ["2024-01-05", "2024-01-10"]  # chronological
+    assert list(history["event"]) == ["1:1", "Planning"]
+    assert list(history["avg_stress"]) == [30.0, 70.0]
+
+
+def test_load_person_history_unknown_attendee_returns_empty_frame(db_path):
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid), _sample_events(target_date, tz))
+
+    history = storage.load_person_history(db_path, "nobody@example.com", date(2024, 1, 1), date(2024, 1, 20))
+    assert history.empty
