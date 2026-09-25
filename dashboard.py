@@ -73,8 +73,12 @@ def render_settings_popover() -> dict:
 
 
 def render_daily_tab(config: dict, db_path: str) -> None:
-    col1, col2 = st.columns([1, 3])
-    with col1:
+    """One compact control/metrics row up top, then the chart gets the full
+    width below it — it's the reason for the tab, not a box squeezed next to
+    the date picker, and a wide chart makes an interactive hover layer
+    actually worth using (more room per minute to aim the pointer at)."""
+    control_col, metric_col1, metric_col2 = st.columns([2, 1, 1])
+    with control_col:
         target_date = st.date_input("Date", value=date.today(), max_value=date.today())
         has_cached = storage.has_day(db_path, target_date)
         force_refresh = st.button(
@@ -86,7 +90,7 @@ def render_daily_tab(config: dict, db_path: str) -> None:
 
     if force_refresh:
         if not ready:
-            st.error("Fill in Settings in the sidebar first.")
+            st.error("Fill in Settings (top right) first.")
             return
         with st.spinner(f"Logging into Garmin and correlating {target_date.isoformat()}…"):
             try:
@@ -115,17 +119,24 @@ def render_daily_tab(config: dict, db_path: str) -> None:
     event_summary = storage.load_event_summary(db_path, target_date)
 
     valid = grid.dropna(subset=["stress"])
-    with col1:
+    with metric_col1:
         if not valid.empty:
             st.metric("Workday average stress", f"{valid['stress'].mean():.1f}")
+    with metric_col2:
+        if not valid.empty:
             st.metric("Workday peak stress", f"{valid['stress'].max():.0f}")
 
-    with col2:
-        if grid.empty:
-            st.info("No data for this date.")
-        else:
-            fig = stress_core.build_daily_chart(grid, events, target_date)
-            st.pyplot(fig, width="stretch")
+    st.divider()
+
+    if grid.empty:
+        st.info("No data for this date.")
+    else:
+        fig = stress_core.build_daily_chart_interactive(grid, events, target_date)
+        st.plotly_chart(fig, width="stretch", theme=None)
+        st.caption(
+            "Hover anywhere on the chart for the exact time, stress level, and which meeting "
+            "(or **No Meeting**) you were in at that moment."
+        )
 
     st.subheader("Stress by meeting")
     if event_summary.empty:

@@ -10,6 +10,7 @@ database before each AppTest run so dashboard.py (which reads it via
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,6 +56,7 @@ def test_dashboard_empty_state_renders_without_exceptions(monkeypatch, tmp_path,
 
     daily_info = " ".join(i.value for i in at.tabs[2].info)
     assert "No stored results" in daily_info or "Fetch from Garmin" in daily_info
+    assert len(at.tabs[2].get("plotly_chart")) == 0  # no chart before any data exists
 
     trends_info = " ".join(i.value for i in at.tabs[3].info)
     assert "No stored results in this range" in trends_info
@@ -116,6 +118,18 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     assert "Workday average stress" in daily_metric_labels
     assert "Workday peak stress" in daily_metric_labels
     assert len(daily_tab.dataframe) == 1  # the "Stress by meeting" table
+
+    # The daily chart is now interactive (Plotly, not matplotlib/st.pyplot).
+    # AppTest has no dedicated `.plotly_chart` accessor like it does for
+    # `.image` (st.pyplot) — st.plotly_chart() shows up as a generic
+    # UnknownElement of type "plotly_chart", fetched via `.get(...)`.
+    daily_plotly_charts = daily_tab.get("plotly_chart")
+    assert len(daily_plotly_charts) == 1
+    spec = json.loads(daily_plotly_charts[0].proto.spec)
+    trace_names = {trace.get("name") for trace in spec["data"]}
+    assert "Stress level" in trace_names  # the stress line itself
+    assert "Standup" in trace_names  # legend entry for the one meeting that day
+    assert spec["layout"].get("hovermode") == "x unified"
 
     # Trends tab default range (today-13..today) includes today.
     trends_tab = at.tabs[3]
