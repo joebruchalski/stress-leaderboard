@@ -29,7 +29,7 @@ def render_settings_popover() -> dict:
     config = stress_core.resolve_config()
     missing = not (config["email"] and config["ics_path"] and config["password"])
 
-    with st.popover(("⚠️ " if missing else "") + "⚙️ Settings"):
+    with st.popover(("⚠️" if missing else "⋮"), help="Settings"):
         with st.form("settings_form", clear_on_submit=False):
             email = st.text_input("Garmin Connect email", value=config["email"])
             ics_path = st.text_input("Path to .ics calendar file", value=config["ics_path"])
@@ -72,14 +72,47 @@ def render_settings_popover() -> dict:
     return config
 
 
+def _shift_daily_detail_date(delta_days: int) -> None:
+    """on_click callback, not a plain post-hoc `if button: mutate` check —
+    Streamlit runs on_click callbacks BEFORE the script body re-executes, so
+    st.session_state.daily_detail_date is already updated by the time the
+    "next day" button's own `disabled=` condition is evaluated later in the
+    same run. A plain post-hoc mutation (mutate only after checking whether
+    the button was clicked, further down in the script) evaluates that
+    `disabled=` against the PRE-click date, showing "▶" as wrongly disabled
+    for one render right after clicking "◀" from today — a real bug caught
+    by testing the actual button interaction, not just eyeballing the code."""
+    new_date = st.session_state.daily_detail_date + timedelta(days=delta_days)
+    st.session_state.daily_detail_date = min(new_date, date.today())
+
+
 def render_daily_tab(config: dict, db_path: str) -> None:
     """One compact control/metrics row up top, then the chart gets the full
     width below it — it's the reason for the tab, not a box squeezed next to
     the date picker, and a wide chart makes an interactive hover layer
     actually worth using (more room per minute to aim the pointer at)."""
-    control_col, metric_col1, metric_col2 = st.columns([2, 1, 1])
-    with control_col:
-        target_date = st.date_input("Date", value=date.today(), max_value=date.today())
+    if "daily_detail_date" not in st.session_state:
+        st.session_state.daily_detail_date = date.today()
+
+    nav_prev, nav_date, nav_next, fetch_col, metric_col1, metric_col2 = st.columns([0.5, 1.6, 0.5, 1.4, 1, 1])
+
+    with nav_prev:
+        st.write("")
+        st.button("◀", help="Previous day", on_click=_shift_daily_detail_date, args=(-1,))
+    with nav_date:
+        target_date = st.date_input("Date", key="daily_detail_date", max_value=date.today())
+    with nav_next:
+        st.write("")
+        st.button(
+            "▶",
+            help="Next day",
+            on_click=_shift_daily_detail_date,
+            args=(1,),
+            disabled=st.session_state.daily_detail_date >= date.today(),
+        )
+
+    with fetch_col:
+        st.write("")
         has_cached = storage.has_day(db_path, target_date)
         force_refresh = st.button(
             "Re-fetch from Garmin" if has_cached else "Fetch from Garmin",
