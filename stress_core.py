@@ -817,3 +817,39 @@ def build_recovery_scatter_chart(df: pd.DataFrame, x_col: str, x_label: str, tit
     fig.update_yaxes(title_text="Workday average stress (0-100)", range=[0, 100])
     _style_plotly_figure(fig, show_legend=False)
     return fig
+
+
+def build_meeting_size_scatter_chart(df: pd.DataFrame) -> go.Figure:
+    """Interactive scatter, one dot per meeting occurrence: x = attendee
+    count, y = that occurrence's average stress — "are big group calls worse
+    than small ones." Same single-scatter, single-axis shape as
+    build_recovery_scatter_chart (no dual-axis, no trendline overlay — the
+    dots alone answer "does X predict Y"), reusing its color/gridline/hover
+    conventions rather than introducing new ones. `df` must have columns
+    attendee_count, avg_stress, event, date (see
+    storage.load_meeting_size_correlation). Hovering a dot shows which
+    meeting/day it is plus both values — otherwise identical-looking dots at
+    the same size/stress are indistinguishable. dtick=1 on the x-axis since
+    attendee count is a small integer, not a continuous quantity — default
+    autotick can otherwise land on fractional headcounts like 2.5."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["attendee_count"],
+            y=df["avg_stress"],
+            mode="markers",
+            marker=dict(color=STRESS_LINE_COLOR, size=10, opacity=0.75, line=dict(width=0)),
+            customdata=df[["event", "date"]],
+            hovertemplate=(
+                "%{customdata[0]}<br>%{customdata[1]}<br>"
+                "Attendees: %{x}<br>Avg stress: %{y:.1f}<extra></extra>"
+            ),
+            showlegend=False,
+        )
+    )
+
+    fig.update_layout(title="Meeting Size vs. Stress")
+    fig.update_xaxes(title_text="Attendee count", dtick=1)
+    fig.update_yaxes(title_text="Average stress (0-100)", range=[0, 100])
+    _style_plotly_figure(fig, show_legend=False)
+    return fig

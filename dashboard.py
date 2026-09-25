@@ -181,6 +181,31 @@ def render_daily_tab(config: dict, db_path: str) -> None:
         )
 
 
+def render_week_over_week_stat(db_path: str) -> None:
+    """'Am I trending better or worse lately' — this week's average stress
+    vs. the week before, as a single stat with a directional arrow, not just
+    the all-time average the trend chart already shows below it. Placed
+    before the trend chart since it's the headline answer to "how am I
+    doing lately"; the chart is the supporting detail underneath."""
+    week = storage.load_week_over_week(db_path)
+    if week["recent_avg"] is None:
+        st.caption("Not enough recent history yet for a week-over-week comparison.")
+        return
+
+    delta = week["delta"]
+    st.metric(
+        "This week's average stress vs. last week",
+        f"{week['recent_avg']:.1f}",
+        delta=f"{delta:+.1f}" if delta is not None else None,
+        delta_color="inverse",  # more stress is bad (red), less is good (green) —
+        # the opposite of Streamlit's default "positive=green" coloring.
+        help=(
+            "Average of daily overall_avg stress over the last 7 days vs. the "
+            "7 days before that. No comparison shown if last week has no stored data."
+        ),
+    )
+
+
 def render_trends_tab(db_path: str) -> None:
     col1, col2 = st.columns(2)
     with col1:
@@ -191,6 +216,8 @@ def render_trends_tab(db_path: str) -> None:
     if start_date > end_date:
         st.error("Start date must be before end date.")
         return
+
+    render_week_over_week_stat(db_path)
 
     daily_summary = storage.load_daily_summary_range(db_path, start_date, end_date)
     if daily_summary.empty:
@@ -209,6 +236,15 @@ def render_trends_tab(db_path: str) -> None:
             rollup.style.format({"avg_stress": "{:.1f}", "peak_stress": "{:.0f}", "total_minutes": "{:.0f}", "occurrences": "{:.0f}"}),
             width="stretch",
         )
+
+    st.subheader("Meeting size vs. stress")
+    st.caption("Does attendee count line up with higher stress — are big group calls worse than small ones?")
+    size_correlation = storage.load_meeting_size_correlation(db_path, start_date, end_date)
+    if size_correlation.empty:
+        st.info("No meetings with stored attendee data in this range.")
+    else:
+        fig = stress_core.build_meeting_size_scatter_chart(size_correlation)
+        st.plotly_chart(fig, width="stretch", theme=None)
 
 
 def render_leaderboard_tab(db_path: str) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -324,6 +324,85 @@ def load_event_rollup(db_path: str, start_date: date, end_date: date) -> pd.Data
     grouped["avg_stress"] = grouped["weighted_avg"] / grouped["total_minutes"]
     grouped = _finalize_avg_delta(grouped)
     return grouped.drop(columns="weighted_avg").sort_values("avg_stress", ascending=False)
+
+
+def load_week_over_week(db_path: str, as_of_date: date | None = None) -> dict:
+    """Compare average stress for the 7 days ending at as_of_date (default
+    today) against the 7 days before that (days 8-14 back) — "am I trending
+    better or worse lately," not just an all-time average.
+
+    "Average stress for a week" here means the plain (unweighted) mean of
+    each day's daily_summary.overall_avg across that week's calendar days —
+    not a minutes-weighted mean over every raw stress_minutes reading. A day
+    is the natural unit for a week-over-week comparison (each day counts
+    once, whether it was a light or a packed calendar day), and overall_avg
+    is already computed and stored per day, so this is also the simpler
+    query: one range SELECT against daily_summary, no join against
+    stress_minutes needed.
+
+    Returns {"recent_avg", "previous_avg", "delta"} (delta = recent -
+    previous). Any value is None where its window has no computable data —
+    a week with zero stored days, or with stored days that all had zero
+    valid stress readings (overall_avg NULL) — never fabricated from
+    nothing. delta is None unless BOTH windows have a value, since a
+    same-vs-nothing comparison isn't a real trend."""
+    if as_of_date is None:
+        as_of_date = date.today()
+    recent_start = as_of_date - timedelta(days=6)
+    previous_start = as_of_date - timedelta(days=13)
+    previous_end = as_of_date - timedelta(days=7)
+
+    with _connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT date, overall_avg FROM daily_summary WHERE date BETWEEN ? AND ?",
+            conn,
+            params=(previous_start.isoformat(), as_of_date.isoformat()),
+        )
+
+    if df.empty:
+        return {"recent_avg": None, "previous_avg": None, "delta": None}
+
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    # SQLite returns an all-NULL column as Python None objects, which pandas
+    # reads back as dtype=object rather than float64 — coerce explicitly so
+    # .mean() below always operates on floats (same idiom as
+    # _add_weighted_delta_columns above).
+    df["overall_avg"] = pd.to_numeric(df["overall_avg"], errors="coerce")
+
+    recent = df[(df["date"] >= recent_start) & (df["date"] <= as_of_date)]
+    previous = df[(df["date"] >= previous_start) & (df["date"] <= previous_end)]
+
+    recent_avg = float(recent["overall_avg"].mean()) if recent["overall_avg"].notna().any() else None
+    previous_avg = float(previous["overall_avg"].mean()) if previous["overall_avg"].notna().any() else None
+    delta = recent_avg - previous_avg if recent_avg is not None and previous_avg is not None else None
+
+    return {"recent_avg": recent_avg, "previous_avg": previous_avg, "delta": delta}
+
+
+def load_meeting_size_correlation(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """One row per meeting occurrence in range: attendee_count (from
+    event_attendees, COUNT(*) grouped by (date, event) — one row per
+    (date, event, attendee) there, so this is exactly the headcount for that
+    occurrence) joined against that occurrence's avg_stress from
+    event_summary, plus the event title and date for hover/labeling. Inner
+    join: only occurrences with at least one stored attendee are included
+    (an occurrence with no attendee rows — e.g. a solo focus block, or an
+    event whose .ics had no attendee list — has no meaningful "size" to
+    plot). Returns an empty DataFrame, never None, when nothing qualifies —
+    consistent with the other load_* range queries here."""
+    with _connect(db_path) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT es.date, es.event, es.avg_stress, COUNT(ea.attendee_email) AS attendee_count
+            FROM event_summary es
+            JOIN event_attendees ea ON ea.date = es.date AND ea.event = es.event
+            WHERE es.date BETWEEN ? AND ?
+            GROUP BY es.date, es.event, es.avg_stress
+            ORDER BY es.date, es.event
+            """,
+            conn,
+            params=(start_date.isoformat(), end_date.isoformat()),
+        )
 
 
 def load_person_rollup(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:

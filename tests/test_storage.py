@@ -4,7 +4,7 @@ tmp_path) — never the user's real ~/.config/stress_analyzer/history.db."""
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -438,3 +438,147 @@ def test_load_person_rollup_avg_delta_weights_across_multiple_days(db_path):
     assert rollup.loc["Alice Anderson", "avg_delta"] == pytest.approx(10.0)
     # avg_stress keeps its existing (unrelated) weighting behavior.
     assert rollup.loc["Alice Anderson", "avg_stress"] == pytest.approx(65.0)
+
+
+# --------------------------------------------------------------------------
+# load_week_over_week
+# --------------------------------------------------------------------------
+
+def _constant_stress_grid(target_date, tz, stress_value):
+    """A single-minute grid whose only valid reading is stress_value, so
+    daily_summary.overall_avg for that day comes out to exactly that value —
+    the simplest way to pin down a day's average for week-over-week tests."""
+    return pd.DataFrame(
+        {
+            "timestamp_local": [datetime.combine(target_date, time(9, 0), tzinfo=tz)],
+            "stress": [stress_value],
+            "event": ["No Meeting"],
+        }
+    )
+
+
+def _save_constant_day(db_path, target_date, tz, stress_value):
+    grid = _constant_stress_grid(target_date, tz, stress_value)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid))
+
+
+def test_load_week_over_week_no_data_returns_none(db_path):
+    storage.init_db(db_path)
+    result = storage.load_week_over_week(db_path, as_of_date=date(2024, 1, 31))
+    assert result == {"recent_avg": None, "previous_avg": None, "delta": None}
+
+
+def test_load_week_over_week_computes_recent_vs_previous_averages(db_path):
+    """as_of=Jan 31: recent week = Jan 25-31 (all stress=80), previous week =
+    Jan 18-24 (all stress=20). Averages and delta must reflect exactly that,
+    not a naive all-time average."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    as_of = date(2024, 1, 31)
+
+    for offset in range(7):  # recent week: Jan 25..31
+        _save_constant_day(db_path, as_of - timedelta(days=offset), tz, 80.0)
+    for offset in range(7, 14):  # previous week: Jan 18..24
+        _save_constant_day(db_path, as_of - timedelta(days=offset), tz, 20.0)
+
+    result = storage.load_week_over_week(db_path, as_of_date=as_of)
+    assert result["recent_avg"] == pytest.approx(80.0)
+    assert result["previous_avg"] == pytest.approx(20.0)
+    assert result["delta"] == pytest.approx(60.0)
+
+
+def test_load_week_over_week_defaults_as_of_date_to_today(db_path):
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    _save_constant_day(db_path, date.today(), tz, 50.0)
+
+    result = storage.load_week_over_week(db_path)  # as_of_date omitted
+    assert result["recent_avg"] == pytest.approx(50.0)
+
+
+def test_load_week_over_week_missing_previous_week_gives_none_delta(db_path):
+    """Only the recent week has any stored data — recent_avg is computable,
+    but there's nothing to compare it against, so previous_avg/delta must be
+    None rather than fabricating a comparison from zero data."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    as_of = date(2024, 1, 31)
+    _save_constant_day(db_path, as_of, tz, 80.0)
+
+    result = storage.load_week_over_week(db_path, as_of_date=as_of)
+    assert result["recent_avg"] == pytest.approx(80.0)
+    assert result["previous_avg"] is None
+    assert result["delta"] is None
+
+
+# --------------------------------------------------------------------------
+# load_meeting_size_correlation
+# --------------------------------------------------------------------------
+
+def test_load_meeting_size_correlation_empty_range_returns_empty_frame(db_path):
+    storage.init_db(db_path)
+    result = storage.load_meeting_size_correlation(db_path, date(2099, 1, 1), date(2099, 1, 2))
+    assert result.empty
+
+
+def test_load_meeting_size_correlation_counts_attendees_per_occurrence(db_path):
+    """Two meeting occurrences on the same day, with different attendee
+    counts — attendee_count must reflect each occurrence's own headcount,
+    joined against its own avg_stress, not mixed up between them."""
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    storage.init_db(db_path)
+
+    timestamps = pd.date_range(
+        datetime.combine(target_date, time(9, 0), tzinfo=tz),
+        datetime.combine(target_date, time(9, 3), tzinfo=tz),
+        freq="1min",
+    )
+    grid = pd.DataFrame(
+        {
+            "timestamp_local": timestamps,
+            "stress": [30.0, 30.0, 70.0, 70.0],
+            "event": ["Small Sync", "Small Sync", "Big Review", "Big Review"],
+        }
+    )
+    events = [
+        {
+            "title": "Small Sync",
+            "start": timestamps[0],
+            "end": timestamps[1],
+            "attendees": [{"email": "alice@example.com", "name": "Alice Anderson"}],
+        },
+        {
+            "title": "Big Review",
+            "start": timestamps[2],
+            "end": timestamps[3],
+            "attendees": [
+                {"email": "alice@example.com", "name": "Alice Anderson"},
+                {"email": "bob@example.com", "name": "Bob Brown"},
+                {"email": "carol@example.com", "name": "Carol Chen"},
+            ],
+        },
+    ]
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid), events)
+
+    result = storage.load_meeting_size_correlation(db_path, target_date, target_date)
+    assert len(result) == 2
+    by_event = result.set_index("event")
+    assert by_event.loc["Small Sync", "attendee_count"] == 1
+    assert by_event.loc["Small Sync", "avg_stress"] == pytest.approx(30.0)
+    assert by_event.loc["Big Review", "attendee_count"] == 3
+    assert by_event.loc["Big Review", "avg_stress"] == pytest.approx(70.0)
+
+
+def test_load_meeting_size_correlation_excludes_events_without_attendees(db_path):
+    """An event_summary row with no matching event_attendees rows (e.g. a
+    meeting whose .ics entry had no attendee list) must not appear — there's
+    no meaningful "size" to plot for it."""
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)  # "Standup" + "No Meeting", no events/attendees passed
+    storage.init_db(db_path)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid))
+
+    result = storage.load_meeting_size_correlation(db_path, target_date, target_date)
+    assert result.empty

@@ -10,11 +10,13 @@ database before each AppTest run so dashboard.py (which reads it via
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
@@ -134,7 +136,9 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     # Trends tab default range (today-13..today) includes today.
     trends_tab = at.tabs[3]
     assert len(trends_tab.info) == 0
-    assert len(trends_tab.get("plotly_chart")) == 1  # the avg/peak trend line chart
+    # avg/peak trend line chart + the meeting-size-vs-stress scatter (today's
+    # Standup has 2 stored attendees, so it has a computable attendee_count).
+    assert len(trends_tab.get("plotly_chart")) == 2
     assert len(trends_tab.dataframe) == 1  # the event rollup table
 
 
@@ -198,6 +202,90 @@ def test_dashboard_recovery_tab_partial_data_shows_info_not_exception(monkeypatc
     assert len(recovery_tab.get("plotly_chart")) == 1  # only the sleep-score chart
     battery_info = " ".join(i.value for i in recovery_tab.info)
     assert "No overlapping Body Battery" in battery_info
+
+
+def test_dashboard_trends_tab_week_over_week_empty_state(monkeypatch, tmp_path, fixtures_dir):
+    """No stored days at all: the week-over-week stat must show its
+    not-enough-history caption instead of a metric, and the tab must still
+    stop cleanly at the "no stored results" empty state (the meeting-size
+    section, like the trend chart and event rollup, only renders once
+    daily_summary has data for the selected range) — no crash either way."""
+    _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    trends_tab = at.tabs[3]
+    assert len(trends_tab.metric) == 0  # no week-over-week comparison with zero stored data
+    caption_text = " ".join(c.value for c in trends_tab.caption)
+    assert "Not enough recent history" in caption_text
+    assert len(trends_tab.get("plotly_chart")) == 0
+    trends_info = " ".join(i.value for i in trends_tab.info)
+    assert "No stored results in this range yet" in trends_info
+
+
+def test_dashboard_trends_tab_week_over_week_and_meeting_size_populated(monkeypatch, tmp_path, fixtures_dir):
+    """14 days of data straddling the recent/previous week boundary, with
+    attendees on each day's meeting — the week-over-week metric should show
+    a real delta, and the meeting-size scatter should render alongside the
+    existing trend chart (two plotly charts total in the tab)."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    today = date.today()
+    for offset in range(14):  # today..today-13, covers both 7-day windows
+        day = today - timedelta(days=offset)
+        stress_value = 80.0 if offset < 7 else 20.0  # recent week higher than previous week
+        timestamps = pd.date_range(
+            datetime.combine(day, time(9, 0), tzinfo=tz),
+            datetime.combine(day, time(9, 1), tzinfo=tz),
+            freq="1min",
+        )
+        grid = pd.DataFrame(
+            {
+                "timestamp_local": timestamps,
+                "stress": [stress_value, stress_value],
+                "event": ["Standup"] * 2,
+            }
+        )
+        events = [
+            {
+                "title": "Standup",
+                "start": timestamps[0],
+                "end": timestamps[1],
+                "attendees": [
+                    {"email": "alice@example.com", "name": "Alice Anderson"},
+                    {"email": "bob@example.com", "name": "Bob Brown"},
+                ],
+            }
+        ]
+        storage.save_day(db_path, day, grid, stress_core.summarize_by_event(grid), events)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    trends_tab = at.tabs[3]
+
+    metric_labels = [m.label for m in trends_tab.metric]
+    assert "This week's average stress vs. last week" in metric_labels
+    week_metric = trends_tab.metric[metric_labels.index("This week's average stress vs. last week")]
+    assert week_metric.value == "80.0"
+    assert week_metric.delta == "+60.0"
+
+    # Trend line chart + the new meeting-size scatter, both Plotly.
+    assert len(trends_tab.get("plotly_chart")) == 2
+    size_chart = trends_tab.get("plotly_chart")[1]
+    spec = json.loads(size_chart.proto.spec)
+    assert spec["layout"]["xaxis"]["title"]["text"] == "Attendee count"
+    # Plotly's JSON spec packs numeric arrays as base64 (dtype + bdata) rather
+    # than a plain list — decode to check the point count/values rather than
+    # assuming list equality.
+    x_field = spec["data"][0]["x"]
+    x_values = np.frombuffer(base64.b64decode(x_field["bdata"]), dtype=x_field["dtype"])
+    assert list(x_values) == [2] * 14  # 2 attendees, once per stored day
 
 
 def test_dashboard_leaderboard_slider_filters_by_meeting_count(monkeypatch, tmp_path, fixtures_dir):
