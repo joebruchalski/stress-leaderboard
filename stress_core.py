@@ -571,7 +571,8 @@ def build_recovery_scatter_chart(df: pd.DataFrame, x_col: str, x_label: str, tit
     ax.set_ylabel("Workday average stress (0-100)")
     ax.set_ylim(0, 100)
     ax.set_title(title)
-    ax.grid(color="#e1e0d9", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)  # zorder=0 on grid() alone doesn't reliably sit behind scatter markers either
+    ax.grid(color="#e1e0d9", linewidth=0.8)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()
