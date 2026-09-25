@@ -94,6 +94,8 @@ def render_daily_tab(config: dict, db_path: str) -> None:
                 st.error(f"Analysis failed: {exc}")
                 return
             event_summary = stress_core.summarize_by_event(grid)
+            deltas = stress_core.compute_meeting_deltas(grid, events)
+            event_summary = event_summary.join(deltas)
             storage.init_db(db_path)
             storage.save_day(db_path, target_date, grid, event_summary, events)
             storage.save_recovery_day(db_path, target_date, recovery["sleep"], recovery["body_battery"])

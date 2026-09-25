@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS event_summary (
     avg_stress REAL,
     peak_stress REAL,
     minutes INTEGER,
+    delta_stress REAL,
     PRIMARY KEY (date, event)
 );
 
@@ -65,9 +66,23 @@ def _connect(db_path: str):
         conn.close()
 
 
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create any missing tables, then defensively migrate any pre-existing
+    ones created before delta_stress existed (e.g. the user's real
+    ~/.config/stress_analyzer/history.db). SQLite has no
+    'ADD COLUMN IF NOT EXISTS', so the standard idiom is try/except on the
+    'duplicate column' OperationalError a second ALTER TABLE raises."""
+    conn.executescript(SCHEMA)
+    try:
+        conn.execute("ALTER TABLE event_summary ADD COLUMN delta_stress REAL")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 def init_db(db_path: str) -> None:
     with _connect(db_path) as conn:
-        conn.executescript(SCHEMA)
+        _ensure_schema(conn)
 
 
 def has_day(db_path: str, target_date: date) -> bool:
@@ -97,7 +112,7 @@ def save_day(
     overall_peak = float(valid["stress"].max()) if not valid.empty else None
 
     with _connect(db_path) as conn:
-        conn.executescript(SCHEMA)
+        _ensure_schema(conn)
         conn.execute("DELETE FROM stress_minutes WHERE date = ?", (date_str,))
         conn.execute("DELETE FROM event_summary WHERE date = ?", (date_str,))
         conn.execute("DELETE FROM event_attendees WHERE date = ?", (date_str,))
@@ -115,12 +130,19 @@ def save_day(
             minute_rows,
         )
 
-        summary_rows = [
-            (date_str, title, float(row["avg_stress"]), float(row["peak_stress"]), int(row["minutes"]))
-            for title, row in event_summary.iterrows()
-        ]
+        summary_rows = []
+        for title, row in event_summary.iterrows():
+            # delta_stress may be entirely absent (callers that haven't
+            # merged compute_meeting_deltas() in yet) or NaN for a given
+            # event (insufficient baseline) — either way, store NULL rather
+            # than fabricating a value.
+            delta_value = row.get("delta_stress")
+            delta_stress = None if delta_value is None or pd.isna(delta_value) else float(delta_value)
+            summary_rows.append(
+                (date_str, title, float(row["avg_stress"]), float(row["peak_stress"]), int(row["minutes"]), delta_stress)
+            )
         conn.executemany(
-            "INSERT INTO event_summary (date, event, avg_stress, peak_stress, minutes) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO event_summary (date, event, avg_stress, peak_stress, minutes, delta_stress) VALUES (?, ?, ?, ?, ?, ?)",
             summary_rows,
         )
 
@@ -247,12 +269,41 @@ def load_daily_summary_range(db_path: str, start_date: date, end_date: date) -> 
         )
 
 
+def _add_weighted_delta_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add weighted_delta/delta_minutes helper columns for a minutes-weighted
+    avg_delta, the same weighting approach already used for avg_stress —
+    except delta_stress can be NULL per-row (insufficient baseline for that
+    occurrence), so those rows contribute zero weight rather than being
+    treated as a zero delta."""
+    df = df.copy()
+    # SQLite returns an all-NULL column as Python None objects, which pandas
+    # reads back as dtype=object rather than float64 — coerce explicitly so
+    # the arithmetic/assignment below always operates on floats.
+    df["delta_stress"] = pd.to_numeric(df["delta_stress"], errors="coerce")
+    has_delta = df["delta_stress"].notna()
+    df["weighted_delta"] = 0.0
+    df.loc[has_delta, "weighted_delta"] = df.loc[has_delta, "delta_stress"] * df.loc[has_delta, "minutes"]
+    df["delta_minutes"] = 0
+    df.loc[has_delta, "delta_minutes"] = df.loc[has_delta, "minutes"]
+    return df
+
+
+def _finalize_avg_delta(grouped: pd.DataFrame) -> pd.DataFrame:
+    """Turn summed weighted_delta/delta_minutes into avg_delta, NaN where no
+    row in the group had a computable delta (rather than dividing 0/0)."""
+    safe_delta_minutes = grouped["delta_minutes"].where(grouped["delta_minutes"] > 0)
+    grouped["avg_delta"] = grouped["weighted_delta"] / safe_delta_minutes
+    return grouped.drop(columns=["weighted_delta", "delta_minutes"])
+
+
 def load_event_rollup(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:
     """Average/peak stress per event title across a date range, weighted by
-    minutes so recurring meetings aggregate correctly across days."""
+    minutes so recurring meetings aggregate correctly across days. Also
+    includes avg_delta: the same minutes-weighted approach applied to
+    before-vs-during meeting stress delta (see stress_core.compute_meeting_deltas)."""
     with _connect(db_path) as conn:
         df = pd.read_sql_query(
-            "SELECT event, avg_stress, peak_stress, minutes FROM event_summary "
+            "SELECT event, avg_stress, peak_stress, minutes, delta_stress FROM event_summary "
             "WHERE date BETWEEN ? AND ?",
             conn,
             params=(start_date.isoformat(), end_date.isoformat()),
@@ -261,13 +312,17 @@ def load_event_rollup(db_path: str, start_date: date, end_date: date) -> pd.Data
         return df
 
     df["weighted_avg"] = df["avg_stress"] * df["minutes"]
+    df = _add_weighted_delta_columns(df)
     grouped = df.groupby("event").agg(
         total_minutes=("minutes", "sum"),
         weighted_avg=("weighted_avg", "sum"),
         peak_stress=("peak_stress", "max"),
         occurrences=("event", "count"),
+        weighted_delta=("weighted_delta", "sum"),
+        delta_minutes=("delta_minutes", "sum"),
     )
     grouped["avg_stress"] = grouped["weighted_avg"] / grouped["total_minutes"]
+    grouped = _finalize_avg_delta(grouped)
     return grouped.drop(columns="weighted_avg").sort_values("avg_stress", ascending=False)
 
 
@@ -320,11 +375,16 @@ def load_person_rollup(db_path: str, start_date: date, end_date: date) -> pd.Dat
     by minutes. Note: an event's full avg/peak/minutes apply to every
     attendee of that event (per-event granularity, not per-minute-per-
     attendee — we don't know who specifically was stressful within a
-    multi-person call, only which calls someone was in)."""
+    multi-person call, only which calls someone was in). Also includes
+    avg_delta: the same minutes-weighted approach applied to before-vs-during
+    meeting stress delta (see stress_core.compute_meeting_deltas) — a more
+    causal "who stresses me out" signal than avg_stress alone, since it
+    isolates stress that rose when the meeting started rather than stress
+    that was already elevated beforehand."""
     with _connect(db_path) as conn:
         df = pd.read_sql_query(
             """
-            SELECT ea.attendee_email, ea.attendee_name, es.avg_stress, es.peak_stress, es.minutes
+            SELECT ea.attendee_email, ea.attendee_name, es.avg_stress, es.peak_stress, es.minutes, es.delta_stress
             FROM event_attendees ea
             JOIN event_summary es ON ea.date = es.date AND ea.event = es.event
             WHERE ea.date BETWEEN ? AND ?
@@ -336,13 +396,17 @@ def load_person_rollup(db_path: str, start_date: date, end_date: date) -> pd.Dat
         return df
 
     df["weighted_avg"] = df["avg_stress"] * df["minutes"]
+    df = _add_weighted_delta_columns(df)
     grouped = df.groupby("attendee_email").agg(
         attendee_name=("attendee_name", "first"),
         total_minutes=("minutes", "sum"),
         weighted_avg=("weighted_avg", "sum"),
         peak_stress=("peak_stress", "max"),
         meetings=("attendee_email", "count"),
+        weighted_delta=("weighted_delta", "sum"),
+        delta_minutes=("delta_minutes", "sum"),
     )
     grouped["avg_stress"] = grouped["weighted_avg"] / grouped["total_minutes"]
+    grouped = _finalize_avg_delta(grouped)
     grouped = grouped.drop(columns="weighted_avg").sort_values("avg_stress", ascending=False)
     return grouped.set_index("attendee_name")

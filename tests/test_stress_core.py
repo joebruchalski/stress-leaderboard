@@ -152,6 +152,146 @@ def test_attach_events_overlap_first_started_wins(local_tz):
 
 
 # --------------------------------------------------------------------------
+# compute_meeting_deltas
+# --------------------------------------------------------------------------
+
+def _grid_with_event(local_tz, target_date, events):
+    """A full 9-5 workday grid with the given events labeled onto it via the
+    real attach_events(), and a uniform placeholder stress value everywhere
+    (tests override specific windows afterward)."""
+    grid = stress_core.build_minute_grid(target_date, local_tz)
+    grid = stress_core.attach_events(grid, events)
+    grid["stress"] = 10.0
+    return grid
+
+
+def _set_stress_window(grid, start, end, value):
+    mask = (grid["timestamp_local"] >= pd.Timestamp(start)) & (grid["timestamp_local"] < pd.Timestamp(end))
+    grid.loc[mask, "stress"] = value
+
+
+def test_compute_meeting_deltas_positive_when_stress_rises_into_meeting(local_tz):
+    target_date = date(2024, 1, 15)
+    event = {
+        "title": "Standup",
+        "start": datetime.combine(target_date, time(10, 0), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(10, 15), tzinfo=local_tz),
+    }
+    grid = _grid_with_event(local_tz, target_date, [event])
+    _set_stress_window(grid, datetime.combine(target_date, time(9, 45), tzinfo=local_tz), event["start"], 20.0)
+    _set_stress_window(grid, event["start"], event["end"], 60.0)
+
+    deltas = stress_core.compute_meeting_deltas(grid, [event])
+    assert deltas.loc["Standup", "delta_stress"] == pytest.approx(40.0)
+
+
+def test_compute_meeting_deltas_negative_when_stress_drops_into_meeting(local_tz):
+    target_date = date(2024, 1, 15)
+    event = {
+        "title": "Focus Time Killer",
+        "start": datetime.combine(target_date, time(14, 0), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(14, 15), tzinfo=local_tz),
+    }
+    grid = _grid_with_event(local_tz, target_date, [event])
+    _set_stress_window(grid, datetime.combine(target_date, time(13, 45), tzinfo=local_tz), event["start"], 70.0)
+    _set_stress_window(grid, event["start"], event["end"], 30.0)
+
+    deltas = stress_core.compute_meeting_deltas(grid, [event])
+    assert deltas.loc["Focus Time Killer", "delta_stress"] == pytest.approx(-40.0)
+
+
+def test_compute_meeting_deltas_nan_when_meeting_starts_at_workday_open(local_tz):
+    """A 9:00 AM meeting has no minutes at all before it in the workday
+    grid — the baseline window can't be satisfied, so the delta must be NaN,
+    not fabricated from a truncated/missing baseline."""
+    target_date = date(2024, 1, 15)
+    event = {
+        "title": "Early Bird",
+        "start": datetime.combine(target_date, time(9, 0), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(9, 15), tzinfo=local_tz),
+    }
+    grid = _grid_with_event(local_tz, target_date, [event])
+
+    deltas = stress_core.compute_meeting_deltas(grid, [event])
+    assert pd.isna(deltas.loc["Early Bird", "delta_stress"])
+
+
+def test_compute_meeting_deltas_nan_when_immediately_preceded_by_another_meeting(local_tz):
+    """Back-to-back meetings with no gap: the "baseline" minutes right
+    before the second meeting are actually claimed by the first meeting in
+    the grid, not "No Meeting" — so they don't count as genuine free time
+    and the delta must be NaN."""
+    target_date = date(2024, 1, 15)
+    event_a = {
+        "title": "Event A",
+        "start": datetime.combine(target_date, time(9, 0), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(9, 30), tzinfo=local_tz),
+    }
+    event_b = {
+        "title": "Event B",
+        "start": datetime.combine(target_date, time(9, 30), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(9, 45), tzinfo=local_tz),
+    }
+    grid = _grid_with_event(local_tz, target_date, [event_a, event_b])
+
+    deltas = stress_core.compute_meeting_deltas(grid, [event_a, event_b])
+    assert pd.isna(deltas.loc["Event A", "delta_stress"])  # nothing before workday open
+    assert pd.isna(deltas.loc["Event B", "delta_stress"])  # baseline window is all Event A
+
+
+def test_compute_meeting_deltas_nan_when_baseline_window_too_short(local_tz):
+    """A meeting at 9:10 AM only has 10 minutes of genuinely free time
+    before it (9:00-9:10), short of the default 15-minute baseline window —
+    must be NaN, not computed from a truncated baseline."""
+    target_date = date(2024, 1, 15)
+    event = {
+        "title": "Late Standup",
+        "start": datetime.combine(target_date, time(9, 10), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(9, 20), tzinfo=local_tz),
+    }
+    grid = _grid_with_event(local_tz, target_date, [event])
+
+    deltas = stress_core.compute_meeting_deltas(grid, [event])
+    assert pd.isna(deltas.loc["Late Standup", "delta_stress"])
+
+
+def test_compute_meeting_deltas_averages_multiple_occurrences_ignoring_nan(local_tz):
+    """A recurring title that happens twice in one day: one occurrence has
+    no computable baseline (NaN), the other does. The title's row must be
+    the valid occurrence's delta alone, not averaged down by the NaN one."""
+    target_date = date(2024, 1, 15)
+    occurrence_1 = {
+        "title": "Standup",
+        "start": datetime.combine(target_date, time(9, 0), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(9, 15), tzinfo=local_tz),
+    }
+    occurrence_2 = {
+        "title": "Standup",
+        "start": datetime.combine(target_date, time(11, 0), tzinfo=local_tz),
+        "end": datetime.combine(target_date, time(11, 15), tzinfo=local_tz),
+    }
+    grid = _grid_with_event(local_tz, target_date, [occurrence_1, occurrence_2])
+    _set_stress_window(
+        grid, datetime.combine(target_date, time(10, 45), tzinfo=local_tz), occurrence_2["start"], 20.0
+    )
+    _set_stress_window(grid, occurrence_2["start"], occurrence_2["end"], 50.0)
+
+    deltas = stress_core.compute_meeting_deltas(grid, [occurrence_1, occurrence_2])
+    assert deltas.loc["Standup", "delta_stress"] == pytest.approx(30.0)
+
+
+def test_compute_meeting_deltas_no_events_returns_empty_frame(local_tz):
+    target_date = date(2024, 1, 15)
+    grid = stress_core.build_minute_grid(target_date, local_tz)
+    grid["event"] = "No Meeting"
+    grid["stress"] = 10.0
+
+    deltas = stress_core.compute_meeting_deltas(grid, [])
+    assert deltas.empty
+    assert list(deltas.columns) == ["delta_stress"]
+
+
+# --------------------------------------------------------------------------
 # fetch_stress_minutes: invalid-value handling
 # --------------------------------------------------------------------------
 

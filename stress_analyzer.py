@@ -140,6 +140,8 @@ def run_single_day(config: dict, target_date: date, db_path: str, output_path: P
 
     storage.init_db(db_path)
     event_summary = stress_core.summarize_by_event(grid)
+    deltas = stress_core.compute_meeting_deltas(grid, events)
+    event_summary = event_summary.join(deltas)
     storage.save_day(db_path, target_date, grid, event_summary, events)
     storage.save_recovery_day(db_path, target_date, recovery["sleep"], recovery["body_battery"])
     print(f"\nResults saved to: {db_path}")
