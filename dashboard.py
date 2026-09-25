@@ -192,7 +192,9 @@ def render_daily_tab(config: dict, db_path: str) -> None:
         st.info("No valid stress readings for this date.")
     else:
         st.dataframe(
-            event_summary.style.format({"avg_stress": "{:.1f}", "peak_stress": "{:.0f}", "minutes": "{:.0f}"}),
+            event_summary.style.format({"avg_stress": "{:.1f}", "peak_stress": "{:.0f}", "minutes": "{:.0f}"}).map(
+                stress_core.stress_severity_css, subset=["avg_stress", "peak_stress"]
+            ),
             width="stretch",
         )
 
@@ -510,7 +512,7 @@ def render_leaderboard_tab(db_path: str) -> None:
             },
             na_rep="–",
         )
-        .background_gradient(subset=["Avg stress"], cmap="Blues", vmin=0, vmax=100)
+        .map(stress_core.stress_severity_css, subset=["Avg stress", "Peak stress"])
         .background_gradient(subset=["Total exposure"], cmap="Blues")
         .bar(subset=["Δ stress (during vs. before)"], align=0, color=["#e34948", "#2a78d6"], vmin=-30, vmax=30),
         column_order=leaderboard_visible_columns,
@@ -531,7 +533,7 @@ def render_leaderboard_tab(db_path: str) -> None:
 
     with st.expander("Chart view (average stress)"):
         fig = stress_core.build_person_rollup_chart(filtered.sort_values("avg_stress", ascending=False).head(20))
-        st.pyplot(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", theme=None)
 
     st.caption(
         "An event's average/peak stress applies to everyone who attended it — this shows who you're "

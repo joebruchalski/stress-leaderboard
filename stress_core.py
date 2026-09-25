@@ -90,6 +90,38 @@ EVENT_COLORS = [
 OVERFLOW_COLOR = "#898781"  # muted gray for the 9th+ distinct event
 STRESS_LINE_COLOR = "#2a78d6"
 
+# Status palette (fixed, never themed — from the dataviz skill's reference
+# palette) for qualitative stress-severity bands, so a value reads at a
+# glance without interpreting the raw number. Bands are even quarters of the
+# 0-100 scale; the printed number stays visible in every cell (not color
+# alone), which is the accessibility mitigation for readers who can't
+# distinguish the hues.
+STRESS_SEVERITY_BANDS = [
+    (25, "#0ca30c"),  # good
+    (50, "#fab219"),  # warning
+    (75, "#ec835a"),  # serious
+    (101, "#d03b3b"),  # critical (upper bound > 100 so 100 itself still matches)
+]
+
+
+def stress_severity_color(value: float) -> str:
+    """Hex color for a 0-100 stress value's severity band, or "" for NaN
+    (Styler treats "" as no styling, e.g. for the Δ column's NaN rows)."""
+    if pd.isna(value):
+        return ""
+    for upper_bound, color in STRESS_SEVERITY_BANDS:
+        if value < upper_bound:
+            return color
+    return STRESS_SEVERITY_BANDS[-1][1]
+
+
+def stress_severity_css(value: float) -> str:
+    """A pandas Styler-compatible CSS string for stress_severity_color() —
+    a soft ~15% tint (not the full-saturation color) so the cell's own text
+    stays legible without needing per-band text-color swaps."""
+    color = stress_severity_color(value)
+    return f"background-color: {color}26" if color else ""
+
 
 class ConfigError(Exception):
     """Raised when required configuration is missing and cannot be prompted for."""
@@ -761,6 +793,17 @@ def build_daily_chart_interactive(grid: pd.DataFrame, events: list[dict], target
         )
     )
 
+    valid_stress = grid["stress"].dropna()
+    if not valid_stress.empty:
+        day_avg = valid_stress.mean()
+        fig.add_hline(
+            y=day_avg,
+            line=dict(color="#52514e", width=1.25, dash="dash"),
+            annotation_text=f"Today's avg: {day_avg:.0f}",
+            annotation_position="top left",
+            annotation=dict(font=dict(size=11, color="#52514e")),
+        )
+
     fig.update_layout(
         title=f"Stress vs. Calendar Events — {target_date.isoformat()}",
         hovermode="x unified",
@@ -826,6 +869,16 @@ def build_trend_chart(daily_summary: pd.DataFrame) -> go.Figure:
         )
     )
 
+    range_avg = daily_summary["overall_avg"].dropna()
+    if not range_avg.empty:
+        fig.add_hline(
+            y=range_avg.mean(),
+            line=dict(color="#52514e", width=1.25, dash="dash"),
+            annotation_text=f"Range avg: {range_avg.mean():.0f}",
+            annotation_position="top left",
+            annotation=dict(font=dict(size=11, color="#52514e")),
+        )
+
     fig.update_layout(
         title="Workday Stress Over Time",
         hovermode="x unified",
@@ -842,25 +895,44 @@ def build_trend_chart(daily_summary: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def build_person_rollup_chart(rollup: pd.DataFrame) -> plt.Figure:
-    """Horizontal ranked bar chart of average stress by meeting attendee.
-    This ranks ONE measure across many categories (a magnitude job), so it
-    uses a single sequential hue rather than the categorical event palette —
-    color isn't carrying identity here, position/label already does.
-    `rollup` must be indexed by display name with an avg_stress column,
-    already sorted descending (see storage.load_person_rollup)."""
-    fig, ax = plt.subplots(figsize=(10, max(3, 0.4 * len(rollup))))
-    ordered = rollup.iloc[::-1]  # barh draws bottom-up; reverse so #1 lands on top
-    ax.barh(ordered.index, ordered["avg_stress"], color=STRESS_LINE_COLOR, height=0.6)
+def build_person_rollup_chart(rollup: pd.DataFrame) -> go.Figure:
+    """Interactive horizontal ranked bar chart of average stress by meeting
+    attendee. This ranks ONE measure across many categories (a magnitude
+    job), so it uses a single sequential hue rather than the categorical
+    event palette — color isn't carrying identity here, position/label
+    already does. Hovering a bar shows the exact avg stress, peak, and
+    meeting count. `rollup` must be indexed by display name with avg_stress/
+    peak_stress/meetings columns, already sorted descending (see
+    storage.load_person_rollup)."""
+    ordered = rollup.iloc[::-1]  # bars draw bottom-up; reverse so #1 lands on top
 
-    ax.set_xlim(0, 100)
-    ax.set_xlabel("Average stress level (0-100)")
-    ax.set_title("Average Stress by Meeting Attendee")
-    ax.set_axisbelow(True)  # zorder=0 on grid() alone doesn't reliably sit behind bar patches
-    ax.grid(axis="x", color="#e1e0d9", linewidth=0.8)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    fig.tight_layout()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=ordered["avg_stress"],
+            y=ordered.index,
+            orientation="h",
+            marker=dict(color=STRESS_LINE_COLOR),
+            customdata=ordered[["peak_stress", "meetings"]],
+            hovertemplate=(
+                "Avg stress: %{x:.1f}<br>Peak: %{customdata[0]:.0f}<br>"
+                "Meetings: %{customdata[1]:.0f}<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title="Average Stress by Meeting Attendee",
+        height=max(250, 32 * len(ordered) + 100),
+    )
+    fig.update_yaxes(title_text=None)
+    _style_plotly_figure(fig, y_gridlines=False, show_legend=False)
+    # Unlike this module's other charts, magnitude is on the x-axis here (a
+    # horizontal bar chart), so the gridlines belong on x, not y —
+    # _style_plotly_figure() assumes the common case (magnitude on y) and
+    # always disables x-gridlines, so override that after the shared call
+    # rather than changing the helper's behavior for every other chart.
+    fig.update_xaxes(title_text="Average stress level (0-100)", range=[0, 100], showgrid=True, gridcolor=GRIDLINE_COLOR, gridwidth=0.8)
     return fig
 
 
@@ -946,34 +1018,45 @@ def build_person_history_chart(history: pd.DataFrame, person_name: str) -> go.Fi
 
     `history` must have columns date (str, ISO), event, avg_stress,
     peak_stress — one row per meeting occurrence, already ordered
-    chronologically (see storage.load_person_history()). Multiple meetings
-    on the same date are plotted at the same x position, distinguished by
-    the event name in the hover tooltip."""
+    chronologically (see storage.load_person_history()).
+
+    x is the meeting's sequence index (0, 1, 2...), NOT the raw date:
+    plotting by date directly put every same-day meeting at the identical
+    x position, which zigzags the line back and forth at that one spot
+    instead of reading as a trend (found and fixed during real-data visual
+    verification — someone with 3 meetings in one day made the chart
+    briefly unreadable). Each occurrence gets its own even spacing instead;
+    the date and specific meeting title are still shown via hover and via
+    sparse tick labels."""
+    n = len(history)
     dates_parsed = pd.to_datetime(history["date"])
+    date_labels = dates_parsed.dt.strftime("%b %-d")
+    x_positions = list(range(n))
+    hover_meta = pd.DataFrame({"event": history["event"], "date": date_labels})
 
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=dates_parsed,
+            x=x_positions,
             y=history["avg_stress"],
             mode="lines+markers",
             name="Avg stress (per meeting)",
             line=dict(color=STRESS_LINE_COLOR, width=2),
             marker=dict(size=6),
-            customdata=history["event"],
-            hovertemplate="%{customdata}<br>Avg stress: %{y:.1f}<extra></extra>",
+            customdata=hover_meta[["date", "event"]],
+            hovertemplate="%{customdata[1]}<br>%{customdata[0]}<br>Avg stress: %{y:.1f}<extra></extra>",
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=dates_parsed,
+            x=x_positions,
             y=history["peak_stress"],
             mode="lines+markers",
             name="Peak stress (per meeting)",
             line=dict(color=EVENT_COLORS[1], width=1.5, dash="dash"),
             marker=dict(size=5),
-            customdata=history["event"],
-            hovertemplate="%{customdata}<br>Peak stress: %{y:.0f}<extra></extra>",
+            customdata=hover_meta[["date", "event"]],
+            hovertemplate="%{customdata[1]}<br>%{customdata[0]}<br>Peak stress: %{y:.0f}<extra></extra>",
         )
     )
 
@@ -981,9 +1064,14 @@ def build_person_history_chart(history: pd.DataFrame, person_name: str) -> go.Fi
         title=f"{person_name} — Stress Across Meetings Over Time",
         hovermode="x unified",
     )
-    span_days = max((dates_parsed.max() - dates_parsed.min()).days, 0) if not history.empty else 0
-    day_step = max(1, round(span_days / 8)) if span_days else 1
-    fig.update_xaxes(title_text="Date", tickformat="%b %-d", dtick=day_step * 86_400_000)
+    tick_step = max(1, round(n / 8)) if n else 1
+    tick_positions = list(range(0, n, tick_step))
+    fig.update_xaxes(
+        title_text="Meeting (chronological)",
+        tickmode="array",
+        tickvals=tick_positions,
+        ticktext=[date_labels.iloc[i] for i in tick_positions],
+    )
     fig.update_yaxes(title_text="Stress level (0-100)", range=[0, 100])
     _style_plotly_figure(fig)
     return fig

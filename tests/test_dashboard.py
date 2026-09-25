@@ -114,8 +114,10 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     rendered = str(leaderboard_tab.dataframe[0].value)
     assert "Alice Anderson" in rendered and "Bob Brown" in rendered
     # Nobody clicked yet: the drill-down section stays in its clean default
-    # state, not showing a chart for anyone.
-    assert len(leaderboard_tab.get("plotly_chart")) == 0
+    # state, not showing a chart for anyone. The Leaderboard's own ranked-bar
+    # chart (in the collapsed "Chart view" expander) is always present
+    # regardless of drill-down selection, so the baseline count is 1, not 0.
+    assert len(leaderboard_tab.get("plotly_chart")) == 1
 
     # Daily Detail tab defaults to today, which now has cached data: expect
     # metrics + a chart + a populated table, not the "no data" empty state.
@@ -421,7 +423,9 @@ def test_dashboard_person_drilldown_default_state_is_clean(monkeypatch, tmp_path
 
     assert not at.exception
     leaderboard_tab = at.tabs[0]
-    assert len(leaderboard_tab.get("plotly_chart")) == 0
+    # 1, not 0: the Leaderboard's own ranked-bar chart is always present;
+    # only the drill-down's chart is conditional on a selection.
+    assert len(leaderboard_tab.get("plotly_chart")) == 1
     captions = " ".join(c.value for c in leaderboard_tab.caption)
     assert "Click a name in either table above" in captions
 
@@ -455,7 +459,8 @@ def test_dashboard_leaderboard_row_selection_shows_person_drilldown(monkeypatch,
     leaderboard_tab = at.tabs[0]
     subheader_labels = [s.value for s in leaderboard_tab.subheader]
     assert any("Alice Anderson" in label and "stress history" in label for label in subheader_labels)
-    assert len(leaderboard_tab.get("plotly_chart")) == 1
+    # 2: the always-present ranked-bar chart, plus the drill-down chart.
+    assert len(leaderboard_tab.get("plotly_chart")) == 2
 
     metric_labels = [m.label for m in leaderboard_tab.metric]
     assert "Meetings" in metric_labels
@@ -469,7 +474,7 @@ def test_dashboard_leaderboard_row_selection_shows_person_drilldown(monkeypatch,
 
     assert not at.exception
     leaderboard_tab = at.tabs[0]
-    assert len(leaderboard_tab.get("plotly_chart")) == 0
+    assert len(leaderboard_tab.get("plotly_chart")) == 1  # ranked-bar chart only, drill-down cleared
     captions = " ".join(c.value for c in leaderboard_tab.caption)
     assert "Click a name in either table above" in captions
 
@@ -495,4 +500,5 @@ def test_dashboard_most_improved_panel_row_selection_shows_person_drilldown(monk
     leaderboard_tab = at.tabs[0]
     subheader_labels = [s.value for s in leaderboard_tab.subheader]
     assert any("Alice Anderson" in label and "stress history" in label for label in subheader_labels)
-    assert len(leaderboard_tab.get("plotly_chart")) == 1
+    # 2: the always-present ranked-bar chart, plus the drill-down chart.
+    assert len(leaderboard_tab.get("plotly_chart")) == 2
