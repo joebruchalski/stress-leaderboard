@@ -13,6 +13,7 @@ from datetime import date, datetime, time
 
 import pandas as pd
 import pytest
+import requests
 
 import stress_core
 
@@ -544,6 +545,114 @@ def test_guess_internal_domain_from_calendar_email():
     assert stress_core.guess_internal_domain("joe@company.com") == "company.com"
     assert stress_core.guess_internal_domain("") == ""
     assert stress_core.guess_internal_domain("not-an-email") == ""
+
+
+# --------------------------------------------------------------------------
+# Live calendar sync (resolve_calendar_bytes): fetch-or-read-local + cache.
+# No real network call is made — requests.get is monkeypatched to return a
+# canned fake response object (there's no HTTP-mocking precedent elsewhere
+# in this codebase yet, so this follows the same "fake stub" style already
+# used for the Garmin API in _FakeGarminApi above, rather than pulling in an
+# extra test-only dependency like the `responses` library for one call site).
+# --------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, content: bytes, status_code: int = 200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} error")
+
+
+@pytest.fixture
+def cache_file(monkeypatch, tmp_path):
+    """Point stress_core's calendar cache at a throwaway path so tests never
+    touch the user's real ~/.config/stress_analyzer/calendar_cache.ics."""
+    path = tmp_path / "calendar_cache.ics"
+    monkeypatch.setattr(stress_core, "CACHE_FILE", path)
+    return path
+
+
+def test_resolve_calendar_bytes_local_file_only_unchanged(fixtures_dir, local_tz, cache_file):
+    """No ics_url set: behaves exactly like reading the local file directly
+    (the pre-existing, currently-working path) — regression coverage."""
+    ics_path = fixtures_dir / "simple.ics"
+    config = {"ics_path": str(ics_path), "ics_url": ""}
+
+    content = stress_core.resolve_calendar_bytes(config)
+
+    assert content == ics_path.read_bytes()
+    # Parses identically to calling load_calendar_events() on the same file.
+    events = stress_core.parse_calendar_events(content, date(2024, 1, 15), local_tz)
+    direct_events = stress_core.load_calendar_events(ics_path, date(2024, 1, 15), local_tz)
+    assert events == direct_events
+    # No live fetch happened, so nothing was written to the cache.
+    assert not cache_file.exists()
+
+
+def test_resolve_calendar_bytes_successful_live_fetch_parses_events(monkeypatch, fixtures_dir, local_tz, cache_file):
+    """A successful fetch from ics_url is parsed correctly and cached."""
+    fixture_bytes = (fixtures_dir / "combined.ics").read_bytes()
+    monkeypatch.setattr(stress_core.requests, "get", lambda url, timeout: _FakeResponse(fixture_bytes))
+
+    config = {"ics_path": "", "ics_url": "https://calendar.example.com/private/me.ics"}
+    content = stress_core.resolve_calendar_bytes(config)
+
+    events = stress_core.parse_calendar_events(content, date(2024, 1, 15), local_tz)
+    titles = sorted(e["title"] for e in events)
+    assert titles == ["Simple Meeting", "Weekly Standup"]
+
+    # The successful fetch was cached for future fallback.
+    assert cache_file.read_bytes() == fixture_bytes
+
+
+def test_resolve_calendar_bytes_failed_fetch_falls_back_to_cache_with_warning(monkeypatch, cache_file):
+    """A failed live fetch with an existing cache falls back to it and warns
+    clearly instead of silently swallowing the failure or crashing."""
+    cached_bytes = b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+    cache_file.write_bytes(cached_bytes)
+
+    def _boom(url, timeout):
+        raise requests.exceptions.ConnectionError("simulated DNS failure")
+
+    monkeypatch.setattr(stress_core.requests, "get", _boom)
+    config = {"ics_path": "", "ics_url": "https://calendar.example.com/private/me.ics"}
+
+    with pytest.warns(RuntimeWarning, match="Live calendar fetch failed"):
+        content = stress_core.resolve_calendar_bytes(config)
+
+    assert content == cached_bytes
+
+
+def test_resolve_calendar_bytes_failed_fetch_no_cache_raises_clear_error(monkeypatch, cache_file):
+    """A failed live fetch with NO cache available yet raises a clear,
+    catchable error rather than crashing obscurely or hanging."""
+    def _boom(url, timeout):
+        raise requests.exceptions.Timeout("simulated timeout")
+
+    monkeypatch.setattr(stress_core.requests, "get", _boom)
+    config = {"ics_path": "", "ics_url": "https://calendar.example.com/private/me.ics"}
+
+    assert not cache_file.exists()
+    with pytest.raises(stress_core.CalendarFetchError, match="no cached calendar is available"):
+        stress_core.resolve_calendar_bytes(config)
+
+
+def test_resolve_calendar_bytes_passes_request_timeout(monkeypatch, cache_file):
+    """A hung request must not block indefinitely — a timeout is always passed."""
+    seen = {}
+
+    def _fake_get(url, timeout):
+        seen["timeout"] = timeout
+        return _FakeResponse(b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+
+    monkeypatch.setattr(stress_core.requests, "get", _fake_get)
+    stress_core.resolve_calendar_bytes({"ics_path": "", "ics_url": "https://calendar.example.com/private/me.ics"})
+
+    assert seen["timeout"] == stress_core.ICS_FETCH_TIMEOUT_SECONDS
+    assert seen["timeout"] is not None
 
 
 # --------------------------------------------------------------------------

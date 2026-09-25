@@ -51,7 +51,12 @@ def prompt_for_missing(config: dict) -> dict:
 
     if changed:
         stress_core.save_config(
-            config["email"], config["ics_path"], config["tokenstore"], config["calendar_email"], config["internal_domain"]
+            config["email"],
+            config["ics_path"],
+            config["tokenstore"],
+            config["calendar_email"],
+            config["internal_domain"],
+            config.get("ics_url", ""),
         )
 
     return config
@@ -74,6 +79,13 @@ def run_setup_wizard() -> None:
     config["ics_path"] = str(ics_path)
     config["calendar_email"] = stress_core.guess_calendar_email(config["ics_path"])
 
+    ics_url_input = input(
+        "Live calendar URL, e.g. a Google/Outlook/iCloud private iCal address (optional — "
+        f"leave blank to keep using the local .ics file above) [{config['ics_url'] or 'none saved'}]: "
+    ).strip()
+    if ics_url_input:
+        config["ics_url"] = ics_url_input
+
     cal_email_input = input(
         f"Your own email as it appears in meeting invites, to exclude from per-person "
         f"stress analysis [{config['calendar_email'] or 'none guessed'}]: "
@@ -92,7 +104,12 @@ def run_setup_wizard() -> None:
     password = getpass.getpass("Garmin Connect password (stored in macOS Keychain, not on disk): ")
     stress_core.save_keychain_password(config["email"], password)
     stress_core.save_config(
-        config["email"], config["ics_path"], config["tokenstore"], config["calendar_email"], config["internal_domain"]
+        config["email"],
+        config["ics_path"],
+        config["tokenstore"],
+        config["calendar_email"],
+        config["internal_domain"],
+        config.get("ics_url", ""),
     )
     print(f"Saved settings to {stress_core.CONFIG_FILE} and password to Keychain.")
     print("You can now run this script unattended (e.g. via launchd) with no prompts.")

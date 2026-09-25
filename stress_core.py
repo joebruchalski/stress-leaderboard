@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import warnings
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
 import recurring_ical_events
+import requests
 from icalendar import Calendar
 from tzlocal import get_localzone
 
@@ -67,6 +69,13 @@ DEFAULT_TOKENSTORE = "~/.garminconnect"
 DEFAULT_DB_PATH = str(CONFIG_DIR / "history.db")
 KEYCHAIN_SERVICE = "stress-analyzer-garmin"
 
+# Live calendar sync (optional, alongside the local .ics file — see
+# resolve_calendar_bytes()): the last successfully-fetched calendar is cached
+# here so a transient network failure falls back to yesterday's good copy
+# instead of taking down an analysis run that would otherwise have worked.
+CACHE_FILE = CONFIG_DIR / "calendar_cache.ics"
+ICS_FETCH_TIMEOUT_SECONDS = 15
+
 # Categorical palette (validated colorblind-safe adjacency), used in fixed order.
 EVENT_COLORS = [
     "#2a78d6",  # blue
@@ -86,6 +95,14 @@ class ConfigError(Exception):
     """Raised when required configuration is missing and cannot be prompted for."""
 
 
+class CalendarFetchError(ValueError):
+    """Raised when a live calendar URL fetch fails and no cached copy exists
+    to fall back to. Subclasses ValueError so existing callers that already
+    catch (ConfigError, ValueError) around calendar/analysis work (see
+    run_single_day/run_backfill in stress_analyzer.py) handle this the same
+    way without needing changes."""
+
+
 # --------------------------------------------------------------------------
 # Configuration: env vars > saved config file / Keychain > caller decides
 # --------------------------------------------------------------------------
@@ -97,7 +114,12 @@ def load_saved_config() -> dict:
 
 
 def save_config(
-    email: str, ics_path: str, tokenstore: str, calendar_email: str = "", internal_domain: str = ""
+    email: str,
+    ics_path: str,
+    tokenstore: str,
+    calendar_email: str = "",
+    internal_domain: str = "",
+    ics_url: str = "",
 ) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(
@@ -108,6 +130,7 @@ def save_config(
                 "tokenstore": tokenstore,
                 "calendar_email": calendar_email,
                 "internal_domain": internal_domain,
+                "ics_url": ics_url,
             },
             indent=2,
         )
@@ -163,6 +186,7 @@ def resolve_config() -> dict:
     saved = load_saved_config()
     email = os.environ.get("GARMIN_EMAIL") or saved.get("email") or ""
     ics_path = os.environ.get("ICS_FILE_PATH") or saved.get("ics_path") or ""
+    ics_url = os.environ.get("ICS_URL") or saved.get("ics_url") or ""
     tokenstore = os.environ.get("GARMIN_TOKENSTORE") or saved.get("tokenstore") or DEFAULT_TOKENSTORE
 
     password = os.environ.get("GARMIN_PASSWORD") or ""
@@ -180,6 +204,7 @@ def resolve_config() -> dict:
         "email": email,
         "password": password,
         "ics_path": ics_path,
+        "ics_url": ics_url,
         "tokenstore": tokenstore,
         "calendar_email": calendar_email,
         "internal_domain": internal_domain,
@@ -339,13 +364,15 @@ def extract_attendees(component, self_email: str, internal_domain: str = "") -> 
     return attendees
 
 
-def load_calendar_events(
-    ics_path: Path, target_date: date, local_tz, self_email: str = "", internal_domain: str = ""
+def parse_calendar_events(
+    ics_bytes: bytes, target_date: date, local_tz, self_email: str = "", internal_domain: str = ""
 ) -> list[dict]:
-    """Parse the .ics file and return timed events (title, start, end,
-    attendees) on target_date, in local time, with recurring events
-    expanded."""
-    calendar = Calendar.from_ical(Path(ics_path).read_bytes())
+    """Parse raw .ics content (bytes) and return timed events (title, start,
+    end, attendees) on target_date, in local time, with recurring events
+    expanded. This is the parsing half of calendar loading — where the bytes
+    came from (a local file vs. a live URL fetch, see resolve_calendar_bytes())
+    is deliberately not this function's concern."""
+    calendar = Calendar.from_ical(ics_bytes)
 
     window_start = datetime.combine(target_date, time.min, tzinfo=local_tz)
     window_end = datetime.combine(target_date, time.max, tzinfo=local_tz)
@@ -368,6 +395,57 @@ def load_calendar_events(
 
     events.sort(key=lambda e: e["start"])
     return events
+
+
+def load_calendar_events(
+    ics_path: Path, target_date: date, local_tz, self_email: str = "", internal_domain: str = ""
+) -> list[dict]:
+    """Parse a local .ics file and return timed events (title, start, end,
+    attendees) on target_date, in local time, with recurring events expanded.
+
+    Unchanged signature/behavior from before live calendar sync was added —
+    this is the local-file path only. For config-driven loading that may use
+    a live URL instead, see resolve_calendar_bytes() + parse_calendar_events()."""
+    return parse_calendar_events(Path(ics_path).read_bytes(), target_date, local_tz, self_email, internal_domain)
+
+
+def resolve_calendar_bytes(config: dict) -> bytes:
+    """Return the raw .ics content to parse for this run: a live fetch from
+    config['ics_url'] if set, otherwise the local config['ics_path'] file —
+    the local-file behavior is unchanged from before this function existed.
+
+    Live fetch resilience: a successful fetch is cached to CACHE_FILE. A
+    failed fetch (timeout, DNS, revoked URL, transient outage) falls back to
+    that cache with a clear warnings.warn() — never a silent swallow — so a
+    network hiccup doesn't take down an analysis run that would otherwise
+    have worked. If no cache exists yet (e.g. first-ever run with a bad URL),
+    raises CalendarFetchError with a clear message rather than propagating
+    a raw requests exception."""
+    ics_url = (config.get("ics_url") or "").strip()
+    if not ics_url:
+        return Path(config["ics_path"]).read_bytes()
+
+    try:
+        response = requests.get(ics_url, timeout=ICS_FETCH_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        content = response.content
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_bytes(content)
+        return content
+    except requests.RequestException as exc:
+        if CACHE_FILE.is_file():
+            warnings.warn(
+                f"Live calendar fetch failed ({exc}); using last cached calendar "
+                f"from {CACHE_FILE} instead. Calendar data may be stale.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return CACHE_FILE.read_bytes()
+        raise CalendarFetchError(
+            f"Live calendar fetch from {ics_url!r} failed ({exc}) and no cached "
+            f"calendar is available yet at {CACHE_FILE}. Fix the URL/network, or "
+            f"set a local ics_path as a fallback."
+        ) from exc
 
 
 # --------------------------------------------------------------------------
@@ -511,8 +589,9 @@ def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[di
     local_tz = get_localzone()
     api = garmin_login(config["email"], config["password"], config["tokenstore"])
     stress_df = fetch_stress_minutes(api, target_date, local_tz)
-    events = load_calendar_events(
-        config["ics_path"], target_date, local_tz, config.get("calendar_email", ""), config.get("internal_domain", "")
+    calendar_bytes = resolve_calendar_bytes(config)
+    events = parse_calendar_events(
+        calendar_bytes, target_date, local_tz, config.get("calendar_email", ""), config.get("internal_domain", "")
     )
 
     grid = build_minute_grid(target_date, local_tz)
