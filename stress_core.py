@@ -22,6 +22,40 @@ import recurring_ical_events
 from icalendar import Calendar
 from tzlocal import get_localzone
 
+# Shared Plotly layout bits so the interactive charts (Trends, Recovery) read
+# as one system with the still-matplotlib charts (Leaderboard, Daily Detail)
+# elsewhere in the app: white surface, the same recessive gridline color, no
+# top/right border.
+GRIDLINE_COLOR = "#e1e0d9"
+_PLOTLY_AXIS_COMMON = dict(
+    zeroline=False,
+    showline=True,
+    linecolor=GRIDLINE_COLOR,
+    ticks="outside",
+    tickcolor=GRIDLINE_COLOR,
+)
+
+
+def _style_plotly_figure(fig: go.Figure, *, y_gridlines: bool = True, show_legend: bool = True) -> go.Figure:
+    """Apply the shared white-surface / recessive-grid look to a Plotly figure
+    in place, and return it (for chaining)."""
+    fig.update_layout(
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(color="#31302a"),
+        margin=dict(l=60, r=20, t=50, b=60),
+        showlegend=show_legend,
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0, bgcolor="rgba(0,0,0,0)"),
+    )
+    fig.update_xaxes(showgrid=False, **_PLOTLY_AXIS_COMMON)
+    fig.update_yaxes(
+        **_PLOTLY_AXIS_COMMON,
+        showgrid=y_gridlines,
+        gridcolor=GRIDLINE_COLOR,
+        gridwidth=0.8,
+    )
+    return fig
+
 WORKDAY_START = time(9, 0)
 WORKDAY_END = time(17, 0)
 INVALID_STRESS_VALUES = {-1, -2}
@@ -681,25 +715,51 @@ def build_daily_chart_interactive(grid: pd.DataFrame, events: list[dict], target
     return fig
 
 
-def build_trend_chart(daily_summary: pd.DataFrame) -> plt.Figure:
-    """Line chart of average/peak workday stress across stored history.
-    daily_summary must have columns: date (str, ISO), overall_avg, overall_peak."""
-    fig, ax = plt.subplots(figsize=(12, 5))
+def build_trend_chart(daily_summary: pd.DataFrame) -> go.Figure:
+    """Interactive line chart of average/peak workday stress across stored
+    history. daily_summary must have columns: date (str, ISO), overall_avg,
+    overall_peak. Hovering either line shows the exact date and value;
+    hovermode="x unified" ties both series together at whatever date the
+    mouse is over, since they share the same date axis."""
     dates_parsed = pd.to_datetime(daily_summary["date"])
 
-    ax.plot(dates_parsed, daily_summary["overall_avg"], color=STRESS_LINE_COLOR, linewidth=2, marker="o", markersize=4, label="Daily average")
-    ax.plot(dates_parsed, daily_summary["overall_peak"], color=EVENT_COLORS[1], linewidth=1.5, linestyle="--", marker="o", markersize=3, label="Daily peak")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=dates_parsed,
+            y=daily_summary["overall_avg"],
+            mode="lines+markers",
+            name="Daily average",
+            line=dict(color=STRESS_LINE_COLOR, width=2),
+            marker=dict(size=6),
+            hovertemplate="Daily average: %{y:.1f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates_parsed,
+            y=daily_summary["overall_peak"],
+            mode="lines+markers",
+            name="Daily peak",
+            line=dict(color=EVENT_COLORS[1], width=1.5, dash="dash"),
+            marker=dict(size=5),
+            hovertemplate="Daily peak: %{y:.1f}<extra></extra>",
+        )
+    )
 
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("Stress level (0-100)")
-    ax.set_xlabel("Date")
-    ax.set_title("Workday Stress Over Time")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %-d", tz="UTC"))
-    ax.grid(axis="y", color="#e1e0d9", linewidth=0.8, zorder=0)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, frameon=False)
-    fig.tight_layout()
+    fig.update_layout(
+        title="Workday Stress Over Time",
+        hovermode="x unified",
+    )
+    # Plotly's date-axis autotick can otherwise land on sub-day steps (e.g.
+    # every 12h) for short ranges, which prints the same day label twice in a
+    # row. Snap the tick step to a whole number of days, sized to keep to
+    # roughly 8 gridlines regardless of the selected range.
+    span_days = max((dates_parsed.max() - dates_parsed.min()).days, 0)
+    day_step = max(1, round(span_days / 8)) if span_days else 1
+    fig.update_xaxes(title_text="Date", tickformat="%b %-d", dtick=day_step * 86_400_000)
+    fig.update_yaxes(title_text="Stress level (0-100)", range=[0, 100])
+    _style_plotly_figure(fig)
     return fig
 
 
@@ -725,30 +785,35 @@ def build_person_rollup_chart(rollup: pd.DataFrame) -> plt.Figure:
     return fig
 
 
-def build_recovery_scatter_chart(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> plt.Figure:
-    """Scatter one dot per day: x = a recovery metric (sleep score or Body
-    Battery), y = that day's average workday stress. Deliberately a single
-    scatter with one axis, not a dual-axis (two y-scales) chart — dual-axis
-    is the #1 chart mistake for exactly this "does X predict Y" question, per
-    the dataviz skill. `df` must have columns [x_col, "overall_avg"], already
-    dropna'd of rows missing either value (see load_recovery_correlation)."""
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(
-        df[x_col],
-        df["overall_avg"],
-        color=STRESS_LINE_COLOR,
-        s=36,
-        alpha=0.75,
-        edgecolors="none",
+def build_recovery_scatter_chart(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> go.Figure:
+    """Interactive scatter, one dot per day: x = a recovery metric (sleep
+    score or Body Battery), y = that day's average workday stress. Hovering a
+    dot shows which day it is plus both values — otherwise there's no way to
+    tell which day a given dot represents. Deliberately a single scatter with
+    one axis, not a dual-axis (two y-scales) chart — dual-axis is the #1
+    chart mistake for exactly this "does X predict Y" question, per the
+    dataviz skill. `df` must have columns [x_col, "overall_avg", "date"],
+    already dropna'd of rows missing either value (see
+    load_recovery_correlation)."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df[x_col],
+            y=df["overall_avg"],
+            mode="markers",
+            marker=dict(color=STRESS_LINE_COLOR, size=10, opacity=0.75, line=dict(width=0)),
+            customdata=df["date"],
+            hovertemplate=(
+                "%{customdata}<br>"
+                + x_label
+                + ": %{x:.0f}<br>Stress: %{y:.1f}<extra></extra>"
+            ),
+            showlegend=False,
+        )
     )
 
-    ax.set_xlabel(x_label)
-    ax.set_ylabel("Workday average stress (0-100)")
-    ax.set_ylim(0, 100)
-    ax.set_title(title)
-    ax.set_axisbelow(True)  # zorder=0 on grid() alone doesn't reliably sit behind scatter markers either
-    ax.grid(color="#e1e0d9", linewidth=0.8)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    fig.tight_layout()
+    fig.update_layout(title=title)
+    fig.update_xaxes(title_text=x_label)
+    fig.update_yaxes(title_text="Workday average stress (0-100)", range=[0, 100])
+    _style_plotly_figure(fig, show_legend=False)
     return fig
