@@ -154,7 +154,7 @@ def render_trends_tab(db_path: str) -> None:
         return
 
     fig = stress_core.build_trend_chart(daily_summary)
-    st.pyplot(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", theme=None)
 
     st.subheader("Average stress by meeting, across this range")
     rollup = storage.load_event_rollup(db_path, start_date, end_date)
@@ -312,7 +312,7 @@ def render_recovery_tab(db_path: str) -> None:
             fig = stress_core.build_recovery_scatter_chart(
                 sleep_df, "sleep_score", "Sleep score (0-100)", "Sleep Score vs. Workday Stress"
             )
-            st.pyplot(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", theme=None)
 
     battery_df = correlation.dropna(subset=["body_battery_high", "overall_avg"])
     with col_battery:
@@ -325,7 +325,7 @@ def render_recovery_tab(db_path: str) -> None:
                 "Body Battery, morning high (0-100)",
                 "Body Battery vs. Workday Stress",
             )
-            st.pyplot(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", theme=None)
 
     st.subheader("Recovery and stress by day")
     st.dataframe(

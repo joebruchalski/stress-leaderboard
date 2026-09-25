@@ -120,6 +120,7 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     # Trends tab default range (today-13..today) includes today.
     trends_tab = at.tabs[3]
     assert len(trends_tab.info) == 0
+    assert len(trends_tab.get("plotly_chart")) == 1  # the avg/peak trend line chart
     assert len(trends_tab.dataframe) == 1  # the event rollup table
 
 
@@ -150,8 +151,10 @@ def test_dashboard_recovery_tab_renders_scatter_charts_when_populated(monkeypatc
     assert not at.exception
     recovery_tab = at.tabs[1]
     assert len(recovery_tab.info) == 0  # populated, not the empty state
-    # st.pyplot() renders as an Image element in AppTest's element tree.
-    assert len(recovery_tab.image) == 2  # sleep-score scatter + Body Battery scatter
+    # st.plotly_chart() has no dedicated AppTest accessor (unlike st.pyplot's
+    # `.image`) — it shows up as an UnknownElement with .type == "plotly_chart",
+    # which Block.get() filters for.
+    assert len(recovery_tab.get("plotly_chart")) == 2  # sleep-score scatter + Body Battery scatter
     assert len(recovery_tab.dataframe) == 1  # the day-by-day table
 
 
@@ -178,7 +181,7 @@ def test_dashboard_recovery_tab_partial_data_shows_info_not_exception(monkeypatc
 
     assert not at.exception
     recovery_tab = at.tabs[1]
-    assert len(recovery_tab.image) == 1  # only the sleep-score chart
+    assert len(recovery_tab.get("plotly_chart")) == 1  # only the sleep-score chart
     battery_info = " ".join(i.value for i in recovery_tab.info)
     assert "No overlapping Body Battery" in battery_info
 
