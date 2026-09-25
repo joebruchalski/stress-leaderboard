@@ -21,49 +21,53 @@ import stress_core
 st.set_page_config(page_title="Stress vs. Calendar", layout="wide")
 
 
-def render_settings_sidebar() -> dict:
+def render_settings_popover() -> dict:
+    """Settings live in a top-right dropdown, not a permanent left sidebar —
+    this is a personal single-user tool used occasionally, not a multi-page
+    app that needs sidebar navigation, so a full-height sidebar was just
+    wasted screen width."""
     config = stress_core.resolve_config()
-
-    st.sidebar.header("Settings")
     missing = not (config["email"] and config["ics_path"] and config["password"])
-    with st.sidebar.form("settings_form", clear_on_submit=False):
-        email = st.text_input("Garmin Connect email", value=config["email"])
-        ics_path = st.text_input("Path to .ics calendar file", value=config["ics_path"])
-        calendar_email = st.text_input(
-            "Your own email as it appears in meeting invites",
-            value=config["calendar_email"],
-            help="Excluded from the 'By Person' tab so you don't show up as your own stressor.",
-        )
-        internal_domain = st.text_input(
-            "Internal email domain (e.g. yourcompany.com)",
-            value=config["internal_domain"],
-            help="'By Person' only shows attendees on this domain — leave blank to include everyone, including customers/vendors.",
-        )
-        password = st.text_input(
-            "Garmin Connect password",
-            type="password",
-            placeholder="leave blank to keep saved password",
-        )
-        submitted = st.form_submit_button("Save settings")
 
-    if submitted:
-        if not email or not ics_path:
-            st.sidebar.error("Email and .ics path are required.")
-        elif not Path(ics_path).expanduser().is_file():
-            st.sidebar.error(f"File not found: {ics_path}")
-        else:
-            stress_core.save_config(
-                email, str(Path(ics_path).expanduser()), config["tokenstore"], calendar_email, internal_domain
+    with st.popover(("⚠️ " if missing else "") + "⚙️ Settings"):
+        with st.form("settings_form", clear_on_submit=False):
+            email = st.text_input("Garmin Connect email", value=config["email"])
+            ics_path = st.text_input("Path to .ics calendar file", value=config["ics_path"])
+            calendar_email = st.text_input(
+                "Your own email as it appears in meeting invites",
+                value=config["calendar_email"],
+                help="Excluded from the leaderboard so you don't show up as your own stressor.",
             )
-            if password:
-                stress_core.save_keychain_password(email, password)
-                st.sidebar.success("Settings saved. Password stored in macOS Keychain.")
-            else:
-                st.sidebar.success("Settings saved.")
-            config = stress_core.resolve_config()
+            internal_domain = st.text_input(
+                "Internal email domain (e.g. yourcompany.com)",
+                value=config["internal_domain"],
+                help="Leaderboard only shows attendees on this domain — leave blank to include everyone, including customers/vendors.",
+            )
+            password = st.text_input(
+                "Garmin Connect password",
+                type="password",
+                placeholder="leave blank to keep saved password",
+            )
+            submitted = st.form_submit_button("Save settings")
 
-    if missing and not submitted:
-        st.sidebar.warning("Fill in your Garmin email, password, and .ics path to run analyses.")
+        if submitted:
+            if not email or not ics_path:
+                st.error("Email and .ics path are required.")
+            elif not Path(ics_path).expanduser().is_file():
+                st.error(f"File not found: {ics_path}")
+            else:
+                stress_core.save_config(
+                    email, str(Path(ics_path).expanduser()), config["tokenstore"], calendar_email, internal_domain
+                )
+                if password:
+                    stress_core.save_keychain_password(email, password)
+                    st.success("Settings saved. Password stored in macOS Keychain.")
+                else:
+                    st.success("Settings saved.")
+                config = stress_core.resolve_config()
+
+        if missing and not submitted:
+            st.warning("Fill in your Garmin email, password, and .ics path to run analyses.")
 
     return config
 
@@ -165,8 +169,8 @@ def render_trends_tab(db_path: str) -> None:
 
 def render_leaderboard_tab(db_path: str) -> None:
     """The primary view: who stresses you out, ranked. Everything else in
-    this dashboard (daily detail, trends, patterns, recovery) is supporting
-    detail — this tab is the headline."""
+    this dashboard (daily detail, trends, recovery) is supporting detail —
+    this tab is the headline."""
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("From", value=date.today() - timedelta(days=89), key="leaderboard_start")
@@ -203,16 +207,20 @@ def render_leaderboard_tab(db_path: str) -> None:
 
     rank_by = st.radio(
         "Rank by",
-        ["Average stress", "Stress increase when the meeting starts (Δ)"],
+        ["Average stress", "Total stress exposure", "Stress increase when the meeting starts (Δ)"],
         horizontal=True,
         help=(
             "Average stress: their meetings' overall stress level, which can reflect a generally "
-            "stressful day, not just them. Δ (delta): how much stress actually rose going into their "
-            "meetings vs. right before — a more causal signal, but needs enough clean before/after data."
+            "stressful day, not just them. Total stress exposure: cumulative stress × time spent "
+            "with them — rewards someone who stresses you a little but constantly, not just one bad "
+            "meeting. Δ (delta): how much stress actually rose going into their meetings vs. right "
+            "before — a more causal signal, but needs enough clean before/after data."
         ),
     )
     if rank_by == "Average stress":
         ranked = filtered.sort_values("avg_stress", ascending=False)
+    elif rank_by == "Total stress exposure":
+        ranked = filtered.sort_values("total_stress_exposure", ascending=False)
     else:
         ranked = filtered.dropna(subset=["avg_delta"]).sort_values("avg_delta", ascending=False)
 
@@ -221,24 +229,38 @@ def render_leaderboard_tab(db_path: str) -> None:
         return
 
     top = ranked.iloc[0]
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("🏆 Top stressor", top.name)
     m2.metric("Avg stress in their meetings", f"{top['avg_stress']:.0f}")
     m3.metric("Meetings together", f"{int(top['meetings'])}")
+    m4.metric("Total stress exposure", f"{top['total_stress_exposure']:,.0f}")
 
     st.subheader("Leaderboard")
     display = ranked.head(20).reset_index().rename(columns={"attendee_name": "Attendee"})
     display.insert(0, "Rank", range(1, len(display) + 1))
-    display = display[["Rank", "Attendee", "meetings", "avg_stress", "peak_stress", "avg_delta"]].set_index("Rank")
-    display.columns = ["Attendee", "Meetings", "Avg stress", "Peak stress", "Δ stress (during vs. before)"]
+    display = display[
+        ["Rank", "Attendee", "meetings", "avg_stress", "peak_stress", "total_stress_exposure", "avg_delta"]
+    ].set_index("Rank")
+    display.columns = ["Attendee", "Meetings", "Avg stress", "Peak stress", "Total exposure", "Δ stress (during vs. before)"]
     st.dataframe(
         display.style.format(
-            {"Meetings": "{:.0f}", "Avg stress": "{:.1f}", "Peak stress": "{:.0f}", "Δ stress (during vs. before)": "{:+.1f}"},
+            {
+                "Meetings": "{:.0f}",
+                "Avg stress": "{:.1f}",
+                "Peak stress": "{:.0f}",
+                "Total exposure": "{:,.0f}",
+                "Δ stress (during vs. before)": "{:+.1f}",
+            },
             na_rep="–",
         )
         .background_gradient(subset=["Avg stress"], cmap="Blues", vmin=0, vmax=100)
+        .background_gradient(subset=["Total exposure"], cmap="Blues")
         .bar(subset=["Δ stress (during vs. before)"], align=0, color=["#e34948", "#2a78d6"], vmin=-30, vmax=30),
         width="stretch",
+    )
+    st.caption(
+        "Total exposure = avg stress × minutes, summed across every meeting with them — not "
+        "capped at 100 like the other columns, since it's a cumulative total, not a level."
     )
 
     with st.expander("Chart view (average stress)"):
@@ -249,34 +271,6 @@ def render_leaderboard_tab(db_path: str) -> None:
         "An event's average/peak stress applies to everyone who attended it — this shows who you're "
         "in stressful meetings WITH, not who specifically causes the stress within a group call."
     )
-
-
-def render_patterns_tab(db_path: str) -> None:
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("From", value=date.today() - timedelta(days=13), key="patterns_start")
-    with col2:
-        end_date = st.date_input("To", value=date.today(), key="patterns_end")
-
-    if start_date > end_date:
-        st.error("Start date must be before end date.")
-        return
-
-    by_weekday = storage.load_stress_by_weekday(db_path, start_date, end_date)
-    st.subheader("By day of week")
-    if by_weekday.empty:
-        st.info("No stored results in this range yet. Run some daily analyses first (Daily Detail tab, or the automated job).")
-    else:
-        fig = stress_core.build_weekday_chart(by_weekday)
-        st.pyplot(fig, width="stretch")
-
-    by_hour = storage.load_stress_by_hour(db_path, start_date, end_date)
-    st.subheader("By time of day")
-    if by_hour.empty:
-        st.info("No stored results in this range yet. Run some daily analyses first (Daily Detail tab, or the automated job).")
-    else:
-        fig = stress_core.build_hourly_chart(by_hour)
-        st.pyplot(fig, width="stretch")
 
 
 def render_recovery_tab(db_path: str) -> None:
@@ -350,22 +344,24 @@ def render_recovery_tab(db_path: str) -> None:
 
 
 def main() -> None:
-    st.title("Who's Stressing You Out")
-    config = render_settings_sidebar()
+    title_col, settings_col = st.columns([6, 1])
+    with title_col:
+        st.title("Who's Stressing You Out")
+    with settings_col:
+        config = render_settings_popover()
+
     db_path = stress_core.DEFAULT_DB_PATH
     storage.init_db(db_path)
 
-    # Leaderboard first — it's the headline. Patterns/Recovery are the other
-    # "why" dimensions. Daily Detail/Trends are granular supporting detail,
-    # pushed last per the user's explicit priority: "the leaderboard... the
-    # other data is more secondary."
-    tab_leaderboard, tab_patterns, tab_recovery, tab_daily, tab_trends = st.tabs(
-        ["🏆 Leaderboard", "Patterns", "Recovery", "Daily Detail", "Trends"]
+    # Leaderboard first — it's the headline. Recovery is the other "why"
+    # dimension. Daily Detail/Trends are granular supporting detail, pushed
+    # last per the user's explicit priority: "the leaderboard... the other
+    # data is more secondary."
+    tab_leaderboard, tab_recovery, tab_daily, tab_trends = st.tabs(
+        ["🏆 Leaderboard", "Recovery", "Daily Detail", "Trends"]
     )
     with tab_leaderboard:
         render_leaderboard_tab(db_path)
-    with tab_patterns:
-        render_patterns_tab(db_path)
     with tab_recovery:
         render_recovery_tab(db_path)
     with tab_daily:
