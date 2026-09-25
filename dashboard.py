@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 import storage
@@ -262,6 +263,142 @@ def render_trends_tab(db_path: str) -> None:
         st.plotly_chart(fig, width="stretch", theme=None)
 
 
+def _consume_person_selection(event, display: "pd.DataFrame", session_key: str) -> tuple[str, str] | None:
+    """Turn an st.dataframe(on_select="rerun", selection_mode="single-row")
+    return value into a (attendee_email, attendee_name) pair, but ONLY the
+    run a row is actually newly clicked — not every run the selection
+    happens to still be active.
+
+    Why this matters: the Leaderboard and the "Most Improved" panel below it
+    are two separate selectable tables, each with its own widget key/state
+    that persists across reruns until the user clicks elsewhere in THAT
+    table. Without tracking whether a given table's selection changed THIS
+    run, whichever table's render call happens to execute later in the
+    script would unconditionally re-assert its (possibly stale) selection
+    every rerun — silently overriding a fresh click the user just made in
+    the other table. Comparing against the previous run's selected row
+    positions (stored under f"{session_key}_sig") makes "last click wins"
+    actually true regardless of which table's code runs first or second."""
+    rows = list(event.selection["rows"]) if event is not None and event.selection else []
+    sig = tuple(rows)
+    prev_sig = st.session_state.get(f"{session_key}_sig")
+    st.session_state[f"{session_key}_sig"] = sig
+    if rows and sig != prev_sig:
+        row = display.iloc[rows[0]]
+        return row["_attendee_email"], row["Attendee"]
+    return None
+
+
+def render_most_improved_panel(db_path: str, start_date: date, end_date: date, min_meetings: int) -> None:
+    """The positive-reinforcement flip side of the ranked "who stresses you
+    out" table above: who's least stressful to work with, and — more
+    interesting than a flat low average, which could just mean you haven't
+    met with them much — whose trend is actually improving over time (see
+    storage.load_person_trend: minutes-weighted avg_stress in the first vs.
+    second half of the selected date range). Kept as a small, clearly
+    separate panel so the positive framing doesn't get lost inside the
+    negative-framed leaderboard."""
+    st.subheader("🕊️ Most Improved / Least Stressful")
+    trend_df = storage.load_person_trend(db_path, start_date, end_date)
+    if trend_df.empty:
+        st.caption("No attendee data in this range yet.")
+        return
+
+    filtered = trend_df[trend_df["meetings"] >= min_meetings]
+    if filtered.empty:
+        st.caption("No one meets the minimum-meetings threshold above.")
+        return
+
+    # People with a computable trend rank first (most-improving/most-negative
+    # trend on top) — that's the more interesting signal this panel exists
+    # for. People without enough history for a trend (see load_person_trend's
+    # min-2-meetings-per-half requirement) still show up, ranked by plain
+    # avg_stress, rather than being silently dropped.
+    have_trend = filtered.dropna(subset=["trend"]).sort_values("trend")
+    no_trend = filtered[filtered["trend"].isna()].sort_values("avg_stress")
+    ranked = pd.concat([have_trend, no_trend]).head(10)
+
+    display = ranked.reset_index().rename(columns={"attendee_name": "Attendee"})
+    display.insert(0, "Rank", range(1, len(display) + 1))
+    display = display[["Rank", "Attendee", "meetings", "avg_stress", "trend", "attendee_email"]].set_index("Rank")
+    display.columns = ["Attendee", "Meetings", "Avg stress", "Trend (2nd half vs. 1st half)", "_attendee_email"]
+    visible_columns = ["Attendee", "Meetings", "Avg stress", "Trend (2nd half vs. 1st half)"]
+
+    event = st.dataframe(
+        display.style.format(
+            {"Meetings": "{:.0f}", "Avg stress": "{:.1f}", "Trend (2nd half vs. 1st half)": "{:+.1f}"},
+            na_rep="–",
+        )
+        # Reversed (low = most saturated) since low avg_stress is the "good"
+        # end here — the opposite intent from the main leaderboard's Blues
+        # gradient, which highlights HIGH avg_stress.
+        .background_gradient(subset=["Avg stress"], cmap="Greens_r", vmin=0, vmax=100)
+        # first color = negative values (improving = good = blue), second =
+        # positive (worsening = bad = red) — confirmed via Styler.bar's
+        # actual rendered output, not assumed from the API docs alone.
+        .bar(subset=["Trend (2nd half vs. 1st half)"], align=0, color=["#2a78d6", "#e34948"], vmin=-30, vmax=30),
+        column_order=visible_columns,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key="most_improved_table",
+    )
+    st.caption(
+        "Trend = avg stress in the second half of the date range minus the first half — negative "
+        "means getting less stressful over time. Needs at least 2 meetings in each half to compute; "
+        "shown as “–” otherwise, not guessed from too little data. Click a row to see their full history."
+    )
+
+    selection = _consume_person_selection(event, display, "most_improved_table")
+    if selection:
+        st.session_state["selected_person_email"], st.session_state["selected_person_name"] = selection
+
+
+def render_person_drilldown(db_path: str, start_date: date, end_date: date) -> None:
+    """Dedicated drill-down view for one person, shown below both leaderboard
+    tables once a row is clicked in either one — chosen over a permanent
+    always-visible area so the default (nobody selected) state stays clean
+    and doesn't compete with the two ranked tables for attention."""
+    email = st.session_state.get("selected_person_email")
+    name = st.session_state.get("selected_person_name")
+    if not email:
+        st.caption("Click a name in either table above to see their full stress history over time.")
+        return
+
+    st.divider()
+    header_col, clear_col = st.columns([5, 1])
+    with header_col:
+        st.subheader(f"📈 {name}'s stress history")
+    with clear_col:
+        st.write("")
+        if st.button("✕ Clear", help="Close this drill-down view"):
+            st.session_state["selected_person_email"] = None
+            st.session_state["selected_person_name"] = None
+            st.rerun()
+
+    history = storage.load_person_history(db_path, email, start_date, end_date)
+    if history.empty:
+        st.info(f"No meeting history for {name} in this date range.")
+        return
+
+    valid = history.dropna(subset=["avg_stress"])
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Meetings", f"{len(history)}")
+    if not valid.empty:
+        h2.metric("Avg stress", f"{valid['avg_stress'].mean():.0f}")
+        h3.metric("Peak stress", f"{valid['peak_stress'].max():.0f}")
+    deltas = history["delta_stress"].dropna()
+    if not deltas.empty:
+        h4.metric("Avg Δ (during vs. before)", f"{deltas.mean():+.1f}")
+
+    fig = stress_core.build_person_history_chart(history, name)
+    st.plotly_chart(fig, width="stretch", theme=None)
+    st.caption(
+        "One point per meeting occurrence with them, in chronological order — a recurring meeting "
+        "on different days shows up as separate points, not flattened into a single average."
+    )
+
+
 def render_leaderboard_tab(db_path: str) -> None:
     """The primary view: who stresses you out, ranked. Everything else in
     this dashboard (daily detail, trends, recovery) is supporting detail —
@@ -334,10 +471,35 @@ def render_leaderboard_tab(db_path: str) -> None:
     display = ranked.head(20).reset_index().rename(columns={"attendee_name": "Attendee"})
     display.insert(0, "Rank", range(1, len(display) + 1))
     display = display[
-        ["Rank", "Attendee", "meetings", "avg_stress", "peak_stress", "total_stress_exposure", "avg_delta"]
+        [
+            "Rank",
+            "Attendee",
+            "meetings",
+            "avg_stress",
+            "peak_stress",
+            "total_stress_exposure",
+            "avg_delta",
+            "attendee_email",
+        ]
     ].set_index("Rank")
-    display.columns = ["Attendee", "Meetings", "Avg stress", "Peak stress", "Total exposure", "Δ stress (during vs. before)"]
-    st.dataframe(
+    display.columns = [
+        "Attendee",
+        "Meetings",
+        "Avg stress",
+        "Peak stress",
+        "Total exposure",
+        "Δ stress (during vs. before)",
+        "_attendee_email",
+    ]
+    leaderboard_visible_columns = [
+        "Attendee",
+        "Meetings",
+        "Avg stress",
+        "Peak stress",
+        "Total exposure",
+        "Δ stress (during vs. before)",
+    ]
+    leaderboard_event = st.dataframe(
         display.style.format(
             {
                 "Meetings": "{:.0f}",
@@ -351,12 +513,21 @@ def render_leaderboard_tab(db_path: str) -> None:
         .background_gradient(subset=["Avg stress"], cmap="Blues", vmin=0, vmax=100)
         .background_gradient(subset=["Total exposure"], cmap="Blues")
         .bar(subset=["Δ stress (during vs. before)"], align=0, color=["#e34948", "#2a78d6"], vmin=-30, vmax=30),
+        column_order=leaderboard_visible_columns,
         width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key="leaderboard_table",
     )
     st.caption(
         "Total exposure = avg stress × minutes, summed across every meeting with them — not "
-        "capped at 100 like the other columns, since it's a cumulative total, not a level."
+        "capped at 100 like the other columns, since it's a cumulative total, not a level. "
+        "Click a row to see that person's full history below."
     )
+
+    selection = _consume_person_selection(leaderboard_event, display, "leaderboard_table")
+    if selection:
+        st.session_state["selected_person_email"], st.session_state["selected_person_name"] = selection
 
     with st.expander("Chart view (average stress)"):
         fig = stress_core.build_person_rollup_chart(filtered.sort_values("avg_stress", ascending=False).head(20))
@@ -366,6 +537,11 @@ def render_leaderboard_tab(db_path: str) -> None:
         "An event's average/peak stress applies to everyone who attended it — this shows who you're "
         "in stressful meetings WITH, not who specifically causes the stress within a group call."
     )
+
+    st.divider()
+    render_most_improved_panel(db_path, start_date, end_date, min_meetings)
+
+    render_person_drilldown(db_path, start_date, end_date)
 
 
 def render_recovery_tab(db_path: str) -> None:

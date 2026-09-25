@@ -108,9 +108,14 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     assert len(leaderboard_tab.slider) == 0
     metric_labels = [m.label for m in leaderboard_tab.metric]
     assert "🏆 Top stressor" in metric_labels
-    assert len(leaderboard_tab.dataframe) == 1
+    # Two selectable tables now: the main leaderboard, and the "Most
+    # Improved / Least Stressful" panel below it.
+    assert len(leaderboard_tab.dataframe) == 2
     rendered = str(leaderboard_tab.dataframe[0].value)
     assert "Alice Anderson" in rendered and "Bob Brown" in rendered
+    # Nobody clicked yet: the drill-down section stays in its clean default
+    # state, not showing a chart for anyone.
+    assert len(leaderboard_tab.get("plotly_chart")) == 0
 
     # Daily Detail tab defaults to today, which now has cached data: expect
     # metrics + a chart + a populated table, not the "no data" empty state.
@@ -335,3 +340,159 @@ def test_dashboard_leaderboard_slider_filters_by_meeting_count(monkeypatch, tmp_
     rendered_all = str(at.tabs[0].dataframe[0].value)
     assert "Alice Anderson" in rendered_all
     assert "Zoe Zimmer" in rendered_all
+
+
+def _save_flat_day(db_path, day, tz, stress_value, email, name, event_title="Sync"):
+    """Minimal single-event/single-attendee day, reused by the "Most
+    Improved" panel and drill-down tests below — every minute in the event
+    gets the same stress value, so avg/first-half/second-half math is easy
+    to predict exactly."""
+    timestamps = pd.date_range(
+        datetime.combine(day, time(9, 0), tzinfo=tz),
+        periods=2,
+        freq="1min",
+    )
+    grid = pd.DataFrame(
+        {"timestamp_local": timestamps, "stress": [stress_value, stress_value], "event": [event_title] * 2}
+    )
+    events = [
+        {
+            "title": event_title,
+            "start": timestamps[0],
+            "end": timestamps[-1] + timedelta(minutes=1),
+            "attendees": [{"email": email, "name": name}],
+        }
+    ]
+    storage.save_day(db_path, day, grid, stress_core.summarize_by_event(grid), events)
+
+
+def test_dashboard_most_improved_panel_ranks_improving_trend_above_worsening(monkeypatch, tmp_path, fixtures_dir):
+    """Alice's stress drops from the first half of the (default 90-day)
+    leaderboard range to the second (improving); Bob's rises (worsening).
+    The "Most Improved / Least Stressful" panel must rank Alice above Bob,
+    and must be a second, separately selectable table alongside the main
+    leaderboard — not folded into it."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    # Default leaderboard range is [today-89, today]; midpoint is ~today-45.
+    # offsets > 45 land in the first half, offsets <= 45 in the second.
+    # Alice and Bob use distinct dates: save_day() replaces a WHOLE day's
+    # results per date (it models one person's single calendar, not
+    # multiple independent people's calendars sharing a date), so reusing
+    # the same date for both would have Bob's save silently wipe Alice's
+    # already-saved attendee rows for that day.
+    for offset in (80, 75):
+        _save_flat_day(db_path, date.today() - timedelta(days=offset), tz, 90.0, "alice@example.com", "Alice Anderson")
+    for offset in (10, 5):
+        _save_flat_day(db_path, date.today() - timedelta(days=offset), tz, 10.0, "alice@example.com", "Alice Anderson")
+
+    for offset in (82, 77):
+        _save_flat_day(db_path, date.today() - timedelta(days=offset), tz, 10.0, "bob@example.com", "Bob Brown")
+    for offset in (12, 7):
+        _save_flat_day(db_path, date.today() - timedelta(days=offset), tz, 90.0, "bob@example.com", "Bob Brown")
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    leaderboard_tab = at.tabs[0]
+    subheader_labels = [s.value for s in leaderboard_tab.subheader]
+    assert any("Most Improved" in label for label in subheader_labels)
+
+    assert len(leaderboard_tab.dataframe) == 2
+    mini_table = leaderboard_tab.dataframe[1].value  # the "Most Improved" panel
+    attendees_in_order = list(mini_table["Attendee"])
+    # Alice (trend -80, improving) must rank above Bob (trend +80, worsening).
+    assert attendees_in_order.index("Alice Anderson") < attendees_in_order.index("Bob Brown")
+
+
+def test_dashboard_person_drilldown_default_state_is_clean(monkeypatch, tmp_path, fixtures_dir):
+    """Before anyone clicks a row, the drill-down section must stay in its
+    clean default state — a caption inviting a click, no chart."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    _save_flat_day(db_path, date.today() - timedelta(days=1), tz, 50.0, "alice@example.com", "Alice Anderson")
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    leaderboard_tab = at.tabs[0]
+    assert len(leaderboard_tab.get("plotly_chart")) == 0
+    captions = " ".join(c.value for c in leaderboard_tab.caption)
+    assert "Click a name in either table above" in captions
+
+
+def test_dashboard_leaderboard_row_selection_shows_person_drilldown(monkeypatch, tmp_path, fixtures_dir):
+    """Clicking (selecting) a row in the main leaderboard table must reveal
+    that person's dedicated history chart below — the actual selection
+    interaction, not just that the underlying data/query works. Follows the
+    same click-a-widget -> rerun -> assert pattern as
+    test_dashboard_leaderboard_slider_filters_by_meeting_count, but for
+    st.dataframe's on_select="rerun" API instead of a slider."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    for offset in (3, 1):
+        _save_flat_day(db_path, date.today() - timedelta(days=offset), tz, 45.0, "alice@example.com", "Alice Anderson")
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+    assert not at.exception
+
+    # Streamlit's dataframe-selection API (verified against the installed
+    # streamlit version, not assumed) surfaces selection state through
+    # session_state under the widget's key: st.session_state[key] =
+    # {"selection": {"rows": [...]}}. Row 0 of the leaderboard table is
+    # Alice, its only attendee.
+    at.session_state["leaderboard_table"] = {"selection": {"rows": [0]}}
+    at.run(timeout=60)
+
+    assert not at.exception
+    leaderboard_tab = at.tabs[0]
+    subheader_labels = [s.value for s in leaderboard_tab.subheader]
+    assert any("Alice Anderson" in label and "stress history" in label for label in subheader_labels)
+    assert len(leaderboard_tab.get("plotly_chart")) == 1
+
+    metric_labels = [m.label for m in leaderboard_tab.metric]
+    assert "Meetings" in metric_labels
+    assert "Avg stress" in metric_labels
+
+    # Clearing the selection returns to the clean default state.
+    clear_buttons = [b for b in leaderboard_tab.button if "Clear" in b.label]
+    assert len(clear_buttons) == 1
+    clear_buttons[0].click()
+    at.run(timeout=60)
+
+    assert not at.exception
+    leaderboard_tab = at.tabs[0]
+    assert len(leaderboard_tab.get("plotly_chart")) == 0
+    captions = " ".join(c.value for c in leaderboard_tab.caption)
+    assert "Click a name in either table above" in captions
+
+
+def test_dashboard_most_improved_panel_row_selection_shows_person_drilldown(monkeypatch, tmp_path, fixtures_dir):
+    """The drill-down must also be reachable from the "Most Improved" panel,
+    not just the main leaderboard table — a separate selectable table with
+    its own widget key."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    for offset in (3, 1):
+        _save_flat_day(db_path, date.today() - timedelta(days=offset), tz, 45.0, "alice@example.com", "Alice Anderson")
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+    assert not at.exception
+
+    at.session_state["most_improved_table"] = {"selection": {"rows": [0]}}
+    at.run(timeout=60)
+
+    assert not at.exception
+    leaderboard_tab = at.tabs[0]
+    subheader_labels = [s.value for s in leaderboard_tab.subheader]
+    assert any("Alice Anderson" in label and "stress history" in label for label in subheader_labels)
+    assert len(leaderboard_tab.get("plotly_chart")) == 1
