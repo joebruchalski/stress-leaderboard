@@ -133,10 +133,14 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help=(
             "Analyze the last N days (today back through N-1 days ago) in one run instead of a "
-            "single --date. Skips dates already in the database (use --force-refresh to redo them "
-            "anyway) and keeps going past per-day failures (e.g. a day with no synced Garmin data) "
-            "instead of aborting the whole batch. Useful for pre-loading history before a demo, so "
-            "the dashboard doesn't need any live Garmin calls while you're showing it to someone."
+            "single --date — e.g. --backfill-days 180 for the past ~6 months, or 365 for a full "
+            "year. Logs in and parses the calendar ONCE for the whole run, not once per day (see "
+            "stress_core.run_bulk_analysis), and paces itself between days to avoid Garmin's rate "
+            "limits, so a large range can still take a while (expect minutes, not seconds). Skips "
+            "dates already in the database (use --force-refresh to redo them anyway) and keeps "
+            "going past per-day failures (e.g. a day with no synced Garmin data) instead of "
+            "aborting the whole batch. Also useful for pre-loading history before a demo, so the "
+            "dashboard doesn't need any live Garmin calls while you're showing it to someone."
         ),
     )
     parser.add_argument(
@@ -171,28 +175,59 @@ def run_single_day(config: dict, target_date: date, db_path: str, output_path: P
 
 
 def run_backfill(config: dict, days: int, db_path: str, force_refresh: bool) -> None:
-    """Analyze the last `days` days, one at a time, never letting one bad day
-    (no synced Garmin data, a transient error) abort the rest of the batch —
-    this is meant to be run well ahead of a live demo so the dashboard can
-    run entirely off stored data with zero live Garmin calls in the room."""
+    """Analyze the last `days` days, reusing ONE Garmin login and ONE parsed
+    calendar across the whole batch (stress_core.run_bulk_analysis) rather
+    than looping run_single_day() — critical for a large historical pull
+    (weeks/months): logging in and re-parsing a multi-MB .ics file per day
+    would be wasteful and risks tripping Garmin's rate limiting. Never lets
+    one bad day (no synced data, a transient error) abort the rest of the
+    batch. Meant to be run well ahead of a live demo (so the dashboard can
+    run entirely off stored data), or to pull in months of history at once."""
     storage.init_db(db_path)
-    results: list[tuple[date, str]] = []
 
-    for offset in range(days):
-        target_date = date.today() - timedelta(days=offset)
-        if not force_refresh and storage.has_day(db_path, target_date):
-            print(f"{target_date.isoformat()}: already have results, skipping (use --force-refresh to redo)")
-            results.append((target_date, "skipped (cached)"))
-            continue
+    all_dates = [date.today() - timedelta(days=offset) for offset in range(days)]
+    if force_refresh:
+        target_dates, skipped_dates = all_dates, []
+    else:
+        target_dates = [d for d in all_dates if not storage.has_day(db_path, d)]
+        skipped_dates = [d for d in all_dates if d not in target_dates]
 
-        print(f"\n{'=' * 60}\n{target_date.isoformat()}\n{'=' * 60}")
+    for d in skipped_dates:
+        print(f"{d.isoformat()}: already have results, skipping (use --force-refresh to redo)")
+
+    results: list[tuple[date, str]] = [(d, "skipped (cached)") for d in skipped_dates]
+    if not target_dates:
+        print("\nNothing to fetch — every requested day is already cached.")
+    else:
+        print(
+            f"\nFetching {len(target_dates)} day(s). This can take a while for a large range — "
+            f"paced at ~{stress_core.BULK_FETCH_DELAY_SECONDS:.0f}s between days to be gentle on "
+            f"Garmin's rate limits, on top of each day's actual fetch time."
+        )
+
+        def on_progress(index: int, total: int, target_date: date) -> None:
+            print(f"[{index + 1}/{total}] {target_date.isoformat()}...")
+
         try:
-            run_single_day(config, target_date, db_path, output_path=None, save_chart=False)
-            results.append((target_date, "ok"))
+            bulk_results = stress_core.run_bulk_analysis(config, target_dates, on_progress=on_progress)
         except (ConfigError, ValueError) as exc:
-            print(f"  -> skipped: {exc}")
-            results.append((target_date, f"failed: {exc}"))
+            sys.exit(f"Backfill aborted before it could start: {exc}")
 
+        for target_date in target_dates:
+            outcome = bulk_results[target_date]
+            if isinstance(outcome, Exception):
+                print(f"  -> {target_date.isoformat()} skipped: {outcome}")
+                results.append((target_date, f"failed: {outcome}"))
+                continue
+            grid, events, recovery = outcome
+            event_summary = stress_core.summarize_by_event(grid)
+            deltas = stress_core.compute_meeting_deltas(grid, events)
+            event_summary = event_summary.join(deltas)
+            storage.save_day(db_path, target_date, grid, event_summary, events)
+            storage.save_recovery_day(db_path, target_date, recovery["sleep"], recovery["body_battery"])
+            results.append((target_date, "ok"))
+
+    results.sort(key=lambda item: item[0], reverse=True)
     print(f"\n{'=' * 60}\nBackfill summary ({days} days)\n{'=' * 60}")
     for target_date, status in results:
         print(f"  {target_date.isoformat()}: {status}")

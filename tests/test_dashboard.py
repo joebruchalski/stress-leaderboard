@@ -502,3 +502,133 @@ def test_dashboard_most_improved_panel_row_selection_shows_person_drilldown(monk
     assert any("Alice Anderson" in label and "stress history" in label for label in subheader_labels)
     # 2: the always-present ranked-bar chart, plus the drill-down chart.
     assert len(leaderboard_tab.get("plotly_chart")) == 2
+
+
+def _fake_bulk_day(target_date, tz, stress_value):
+    timestamps = pd.date_range(
+        datetime.combine(target_date, time(9, 0), tzinfo=tz),
+        datetime.combine(target_date, time(9, 2), tzinfo=tz),
+        freq="1min",
+    )
+    grid = pd.DataFrame(
+        {"timestamp_local": timestamps, "stress": [stress_value] * 3, "event": ["No Meeting"] * 3}
+    )
+    return grid, [], {"sleep": None, "body_battery": None}
+
+
+def test_dashboard_backfill_control_default_state(monkeypatch, tmp_path, fixtures_dir):
+    """Default render: the expander/controls exist, 180-day default, no
+    exceptions, nothing fetched until the button is clicked."""
+    _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    assert "📥 Backfill history (e.g. pull in the last 6 months)" in [e.label for e in at.expander]
+    days_input = [n for n in at.number_input if n.label == "Days back"][0]
+    assert days_input.value == 180
+    assert "Start backfill" in [b.label for b in at.button]
+
+
+def test_dashboard_backfill_control_nothing_to_do_when_all_cached(monkeypatch, tmp_path, fixtures_dir):
+    """If every requested day is already stored, clicking Start must report
+    that cleanly rather than trying (and failing) to log in to Garmin."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+    for offset in range(3):
+        d = date.today() - timedelta(days=offset)
+        grid, events, _ = _fake_bulk_day(d, tz, 30.0)
+        storage.save_day(db_path, d, grid, stress_core.summarize_by_event(grid))
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("run_bulk_analysis should not be called when nothing needs fetching")
+
+    monkeypatch.setattr(stress_core, "run_bulk_analysis", _fail_if_called)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+    days_input = [n for n in at.number_input if n.label == "Days back"][0]
+    days_input.set_value(3)
+    start_button = [b for b in at.button if b.label == "Start backfill"][0]
+    start_button.click()
+    at.run(timeout=60)
+
+    assert not at.exception
+    success_messages = " ".join(s.value for s in at.success)
+    assert "already stored" in success_messages
+
+
+def test_dashboard_backfill_control_fetches_missing_days_only(monkeypatch, tmp_path, fixtures_dir):
+    """The actual fetch path: mocks run_bulk_analysis (no real Garmin calls)
+    to confirm the dashboard correctly saves each returned day and reports
+    the right counts — real wiring, not just that the mocked function runs."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    today = date.today()
+    cached_day = today - timedelta(days=1)
+    grid, events, _ = _fake_bulk_day(cached_day, tz, 30.0)
+    storage.save_day(db_path, cached_day, grid, stress_core.summarize_by_event(grid))
+
+    calls = []
+
+    def fake_run_bulk_analysis(config, dates, on_progress=None):
+        calls.append(list(dates))
+        results = {}
+        for i, d in enumerate(dates):
+            if on_progress:
+                on_progress(i, len(dates), d)
+            results[d] = _fake_bulk_day(d, tz, 50.0)
+        return results
+
+    monkeypatch.setattr(stress_core, "run_bulk_analysis", fake_run_bulk_analysis)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+    days_input = [n for n in at.number_input if n.label == "Days back"][0]
+    days_input.set_value(3)  # today, cached_day (skip), and one more day back
+    start_button = [b for b in at.button if b.label == "Start backfill"][0]
+    start_button.click()
+    at.run(timeout=60)
+
+    assert not at.exception
+    assert len(calls) == 1
+    fetched_dates = set(calls[0])
+    assert cached_day not in fetched_dates  # already stored, must be skipped
+    assert today in fetched_dates
+
+    success_messages = " ".join(s.value for s in at.success)
+    assert "Backfilled 2 day(s)" in success_messages
+    # The newly-fetched days must actually be persisted, not just reported.
+    assert storage.has_day(db_path, today)
+    assert storage.has_day(db_path, today - timedelta(days=2))
+
+
+def test_dashboard_backfill_control_requires_settings(monkeypatch, tmp_path, fixtures_dir):
+    """Clicking Start with incomplete Settings (no password) must show a
+    clear error and never call run_bulk_analysis."""
+    monkeypatch.setenv("GARMIN_EMAIL", "test@example.com")
+    monkeypatch.setenv("ICS_FILE_PATH", str(fixtures_dir / "simple.ics"))
+    monkeypatch.setenv("GARMIN_TOKENSTORE", str(tmp_path / "tokenstore"))
+    monkeypatch.delenv("GARMIN_PASSWORD", raising=False)
+    monkeypatch.setattr(stress_core, "get_keychain_password", lambda email: None)
+    db_path = str(tmp_path / "history.db")
+    monkeypatch.setattr(stress_core, "DEFAULT_DB_PATH", db_path)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("run_bulk_analysis should not be called without complete Settings")
+
+    monkeypatch.setattr(stress_core, "run_bulk_analysis", _fail_if_called)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+    start_button = [b for b in at.button if b.label == "Start backfill"][0]
+    start_button.click()
+    at.run(timeout=60)
+
+    assert not at.exception
+    errors = " ".join(e.value for e in at.error)
+    assert "Settings" in errors

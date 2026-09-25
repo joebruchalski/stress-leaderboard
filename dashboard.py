@@ -616,6 +616,84 @@ def render_recovery_tab(db_path: str) -> None:
     )
 
 
+def render_backfill_control(config: dict, db_path: str) -> None:
+    """A big historical pull — e.g. "get me the last 6 months" — not a
+    per-visit action, so it lives in a collapsed expander above the tabs
+    rather than cluttering any one tab. Runs stress_core.run_bulk_analysis()
+    (one login, one calendar parse, paced between days) so a 180+ day pull
+    doesn't hammer Garmin the way looping the single-day path would."""
+    with st.expander("📥 Backfill history (e.g. pull in the last 6 months)"):
+        st.caption(
+            "Fetches Garmin + calendar data for a range of past days, skipping any day already "
+            "stored. A large range (months) makes many Garmin API calls in one run and can take "
+            "several minutes — this paces itself between days to avoid Garmin's rate limits, but "
+            "there's no way to make months of history arrive instantly."
+        )
+        days_back = st.number_input(
+            "Days back", min_value=1, max_value=365, value=180, step=1, help="180 ≈ 6 months, 365 = a full year."
+        )
+        force_refresh = st.checkbox("Re-fetch days that are already stored", value=False)
+        start_clicked = st.button("Start backfill", type="primary")
+
+        if not start_clicked:
+            return
+
+        ready = config["email"] and config["ics_path"] and config["password"]
+        if not ready:
+            st.error("Fill in Settings (top right) first.")
+            return
+
+        all_dates = [date.today() - timedelta(days=n) for n in range(int(days_back))]
+        target_dates = all_dates if force_refresh else [d for d in all_dates if not storage.has_day(db_path, d)]
+        already_cached = len(all_dates) - len(target_dates)
+
+        if not target_dates:
+            st.success(f"Nothing to do — all {len(all_dates)} day(s) in that range are already stored.")
+            return
+
+        st.write(f"Fetching {len(target_dates)} day(s) ({already_cached} already cached, skipped)...")
+        progress_bar = st.progress(0.0)
+        status = st.empty()
+
+        def on_progress(index: int, total: int, target_date: date) -> None:
+            progress_bar.progress(index / total)
+            status.text(f"[{index + 1}/{total}] {target_date.isoformat()}...")
+
+        try:
+            with st.spinner("Logging into Garmin..."):
+                bulk_results = stress_core.run_bulk_analysis(config, target_dates, on_progress=on_progress)
+        except (stress_core.ConfigError, ValueError) as exc:
+            st.error(f"Backfill aborted before it could start: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - surface any other Garmin/network failure
+            st.error(f"Backfill aborted before it could start: {exc}")
+            return
+
+        storage.init_db(db_path)
+        ok_count = 0
+        failed: list[tuple[date, str]] = []
+        for target_date in target_dates:
+            outcome = bulk_results[target_date]
+            if isinstance(outcome, Exception):
+                failed.append((target_date, str(outcome)))
+                continue
+            grid, events, recovery = outcome
+            event_summary = stress_core.summarize_by_event(grid)
+            deltas = stress_core.compute_meeting_deltas(grid, events)
+            event_summary = event_summary.join(deltas)
+            storage.save_day(db_path, target_date, grid, event_summary, events)
+            storage.save_recovery_day(db_path, target_date, recovery["sleep"], recovery["body_battery"])
+            ok_count += 1
+
+        progress_bar.progress(1.0)
+        status.text("Done.")
+        st.success(f"Backfilled {ok_count} day(s).")
+        if failed:
+            with st.expander(f"{len(failed)} day(s) had no usable data (e.g. not synced) — click for details"):
+                for target_date, reason in sorted(failed, reverse=True):
+                    st.text(f"{target_date.isoformat()}: {reason}")
+
+
 def main() -> None:
     title_col, settings_col = st.columns([6, 1])
     with title_col:
@@ -625,6 +703,8 @@ def main() -> None:
 
     db_path = stress_core.DEFAULT_DB_PATH
     storage.init_db(db_path)
+
+    render_backfill_control(config, db_path)
 
     # Leaderboard first — it's the headline. Recovery is the other "why"
     # dimension. Daily Detail/Trends are granular supporting detail, pushed

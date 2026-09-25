@@ -12,7 +12,9 @@ import os
 import subprocess
 import warnings
 from datetime import date, datetime, time
+from time import sleep  # NOT `import time` - that name is already datetime.time above
 from pathlib import Path
+from typing import Callable
 
 import garminconnect
 import matplotlib.dates as mdates
@@ -396,16 +398,15 @@ def extract_attendees(component, self_email: str, internal_domain: str = "") -> 
     return attendees
 
 
-def parse_calendar_events(
-    ics_bytes: bytes, target_date: date, local_tz, self_email: str = "", internal_domain: str = ""
+def extract_calendar_events(
+    calendar: Calendar, target_date: date, local_tz, self_email: str = "", internal_domain: str = ""
 ) -> list[dict]:
-    """Parse raw .ics content (bytes) and return timed events (title, start,
-    end, attendees) on target_date, in local time, with recurring events
-    expanded. This is the parsing half of calendar loading — where the bytes
-    came from (a local file vs. a live URL fetch, see resolve_calendar_bytes())
-    is deliberately not this function's concern."""
-    calendar = Calendar.from_ical(ics_bytes)
-
+    """Same job as parse_calendar_events(), but takes an ALREADY-PARSED
+    icalendar.Calendar object instead of raw bytes. Calendar.from_ical() on a
+    multi-MB .ics file is real CPU work — for a single day that's negligible,
+    but a bulk historical backfill (see run_bulk_analysis()) calls this once
+    per date, and re-parsing the whole calendar hundreds of times for a
+    6-month pull would be wasteful. Parse once, extract many times."""
     window_start = datetime.combine(target_date, time.min, tzinfo=local_tz)
     window_end = datetime.combine(target_date, time.max, tzinfo=local_tz)
     occurrences = recurring_ical_events.of(calendar).between(window_start, window_end)
@@ -427,6 +428,20 @@ def parse_calendar_events(
 
     events.sort(key=lambda e: e["start"])
     return events
+
+
+def parse_calendar_events(
+    ics_bytes: bytes, target_date: date, local_tz, self_email: str = "", internal_domain: str = ""
+) -> list[dict]:
+    """Parse raw .ics content (bytes) and return timed events (title, start,
+    end, attendees) on target_date, in local time, with recurring events
+    expanded. This is the parsing half of calendar loading — where the bytes
+    came from (a local file vs. a live URL fetch, see resolve_calendar_bytes())
+    is deliberately not this function's concern. For calling this repeatedly
+    against the same calendar (a bulk backfill), use extract_calendar_events()
+    with a Calendar you parse once yourself instead of re-parsing here each
+    time."""
+    return extract_calendar_events(Calendar.from_ical(ics_bytes), target_date, local_tz, self_email, internal_domain)
 
 
 def load_calendar_events(
@@ -607,6 +622,30 @@ def compute_meeting_deltas(
     return pd.DataFrame(rows).set_index("event")
 
 
+def _run_analysis_for_date(
+    api: garminconnect.Garmin, calendar: Calendar, target_date: date, local_tz, config: dict
+) -> tuple[pd.DataFrame, list[dict], dict]:
+    """The actual per-date correlation work, given an ALREADY-authenticated
+    api and an ALREADY-parsed calendar. Both run_analysis() (single day: logs
+    in and parses fresh every call — fine for that case) and
+    run_bulk_analysis() (many days: logs in and parses ONCE, see there for
+    why that matters) build on this."""
+    stress_df = fetch_stress_minutes(api, target_date, local_tz)
+    events = extract_calendar_events(
+        calendar, target_date, local_tz, config.get("calendar_email", ""), config.get("internal_domain", "")
+    )
+
+    grid = build_minute_grid(target_date, local_tz)
+    grid = attach_stress(grid, stress_df)
+    grid = attach_events(grid, events)
+
+    recovery = {
+        "sleep": fetch_sleep_summary(api, target_date),
+        "body_battery": fetch_body_battery_summary(api, target_date),
+    }
+    return grid, events, recovery
+
+
 def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[dict], dict]:
     """End-to-end: log in, fetch stress, parse calendar, correlate. Returns
     the minute-level grid (timestamp_local, stress, event), the raw event
@@ -620,21 +659,56 @@ def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[di
     the existing items."""
     local_tz = get_localzone()
     api = garmin_login(config["email"], config["password"], config["tokenstore"])
-    stress_df = fetch_stress_minutes(api, target_date, local_tz)
-    calendar_bytes = resolve_calendar_bytes(config)
-    events = parse_calendar_events(
-        calendar_bytes, target_date, local_tz, config.get("calendar_email", ""), config.get("internal_domain", "")
-    )
+    calendar = Calendar.from_ical(resolve_calendar_bytes(config))
+    return _run_analysis_for_date(api, calendar, target_date, local_tz, config)
 
-    grid = build_minute_grid(target_date, local_tz)
-    grid = attach_stress(grid, stress_df)
-    grid = attach_events(grid, events)
 
-    recovery = {
-        "sleep": fetch_sleep_summary(api, target_date),
-        "body_battery": fetch_body_battery_summary(api, target_date),
-    }
-    return grid, events, recovery
+BULK_FETCH_DELAY_SECONDS = 1.5  # gentle pacing between days in run_bulk_analysis()
+
+
+def run_bulk_analysis(
+    config: dict,
+    dates: list[date],
+    on_progress: Callable[[int, int, date], None] | None = None,
+) -> dict[date, tuple[pd.DataFrame, list[dict], dict] | Exception]:
+    """Analyze many dates reusing ONE Garmin login and ONE parsed calendar —
+    for a large historical pull (e.g. 6 months / ~180 days), doing what
+    run_analysis() does per day (fresh login + fresh multi-MB .ics parse
+    every single call) would be wasteful and, more importantly, risks
+    tripping Garmin's IP-based rate limiting across hundreds of sequential
+    logins (this project has hit real 429s from far smaller call volumes
+    than a 6-month backfill implies). A short delay is still added between
+    days on top of the login/parse savings, since the stress/sleep/Body
+    Battery fetches themselves are still one Garmin API call each per day.
+
+    Never raises for a single bad date (no synced data that day, a transient
+    fetch error) — that date's value in the returned dict is the Exception
+    instead of a result tuple, so the caller can report it and continue,
+    same "skip and keep going" contract as stress_analyzer.py's
+    run_backfill(). DOES raise ConfigError/CalendarFetchError up front if
+    login or the initial calendar fetch fails — those aren't per-date
+    problems, there's no point starting 180 iterations doomed to all fail
+    the same way.
+
+    `on_progress`, if given, is called as on_progress(index, total, date)
+    before each date is attempted — for a progress bar (dashboard) or a
+    printed line (CLI)."""
+    local_tz = get_localzone()
+    api = garmin_login(config["email"], config["password"], config["tokenstore"])
+    calendar = Calendar.from_ical(resolve_calendar_bytes(config))
+
+    results: dict[date, tuple[pd.DataFrame, list[dict], dict] | Exception] = {}
+    total = len(dates)
+    for index, target_date in enumerate(dates):
+        if on_progress:
+            on_progress(index, total, target_date)
+        try:
+            results[target_date] = _run_analysis_for_date(api, calendar, target_date, local_tz, config)
+        except Exception as exc:  # noqa: BLE001 - one bad date must not abort the whole bulk pull
+            results[target_date] = exc
+        if index < total - 1:
+            sleep(BULK_FETCH_DELAY_SECONDS)
+    return results
 
 
 # --------------------------------------------------------------------------

@@ -9,7 +9,7 @@ below.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 import pandas as pd
 import pytest
@@ -690,3 +690,105 @@ def test_build_event_color_map_overflows_past_palette():
         assert color_map[f"Event {i}"] == stress_core.EVENT_COLORS[i]
     assert color_map["Event 8"] == stress_core.OVERFLOW_COLOR
     assert color_map["Event 9"] == stress_core.OVERFLOW_COLOR
+
+
+# --------------------------------------------------------------------------
+# run_bulk_analysis: reuses ONE login + ONE parsed calendar across many dates
+# --------------------------------------------------------------------------
+
+_MINIMAL_ICS = b"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+CALSCALE:GREGORIAN
+END:VCALENDAR
+"""
+
+
+def test_run_bulk_analysis_logs_in_and_parses_calendar_exactly_once(monkeypatch):
+    """The whole point of run_bulk_analysis over calling run_analysis() in a
+    loop: one login, one calendar parse, not one per date — verified by call
+    count, not just by reading the code."""
+    login_calls = []
+    calendar_fetch_calls = []
+    sleep_calls = []
+    fake_api = _FakeGarminApi([[0, 40]])
+
+    def fake_login(email, password, tokenstore):
+        login_calls.append((email, password, tokenstore))
+        return fake_api
+
+    def fake_resolve_calendar_bytes(config):
+        calendar_fetch_calls.append(config)
+        return _MINIMAL_ICS
+
+    monkeypatch.setattr(stress_core, "garmin_login", fake_login)
+    monkeypatch.setattr(stress_core, "resolve_calendar_bytes", fake_resolve_calendar_bytes)
+    monkeypatch.setattr(stress_core, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    dates = [date(2024, 1, 15) - timedelta(days=n) for n in range(3)]
+    config = {"email": "e", "password": "p", "tokenstore": "~/.garminconnect", "ics_path": "unused.ics"}
+
+    results = stress_core.run_bulk_analysis(config, dates)
+
+    assert len(login_calls) == 1  # NOT once per date
+    assert len(calendar_fetch_calls) == 1  # NOT once per date
+    assert set(results.keys()) == set(dates)
+    for d in dates:
+        grid, events, recovery = results[d]
+        assert not grid.empty
+    # a delay is inserted BETWEEN dates, so 3 dates -> 2 sleeps, not 3
+    assert sleep_calls == [stress_core.BULK_FETCH_DELAY_SECONDS, stress_core.BULK_FETCH_DELAY_SECONDS]
+
+
+def test_run_bulk_analysis_isolates_a_single_bad_date(monkeypatch):
+    """One date's fetch failure must not abort the rest of the batch — same
+    'skip and keep going' contract as the CLI's --backfill-days."""
+
+    class _PerDateFailingApi:
+        def __init__(self):
+            self.calls = []
+
+        def get_stress_data(self, date_str):
+            self.calls.append(date_str)
+            if date_str == "2024-01-14":
+                raise RuntimeError("simulated transient Garmin failure")
+            return {"stressValuesArray": [[0, 40]]}
+
+        def get_sleep_data(self, cdate):
+            return None
+
+        def get_body_battery(self, startdate, enddate=None):
+            return None
+
+    fake_api = _PerDateFailingApi()
+    monkeypatch.setattr(stress_core, "garmin_login", lambda email, password, tokenstore: fake_api)
+    monkeypatch.setattr(stress_core, "resolve_calendar_bytes", lambda config: _MINIMAL_ICS)
+    monkeypatch.setattr(stress_core, "sleep", lambda seconds: None)
+
+    dates = [date(2024, 1, 15), date(2024, 1, 14), date(2024, 1, 13)]
+    config = {"email": "e", "password": "p", "tokenstore": "~/.garminconnect", "ics_path": "unused.ics"}
+
+    results = stress_core.run_bulk_analysis(config, dates)
+
+    assert isinstance(results[date(2024, 1, 14)], Exception)
+    assert not isinstance(results[date(2024, 1, 15)], Exception)
+    assert not isinstance(results[date(2024, 1, 13)], Exception)
+    # all three dates were still attempted despite the middle one failing
+    assert fake_api.calls == ["2024-01-15", "2024-01-14", "2024-01-13"]
+
+
+def test_run_bulk_analysis_progress_callback_reports_index_total_date(monkeypatch):
+    fake_api = _FakeGarminApi([[0, 40]])
+    monkeypatch.setattr(stress_core, "garmin_login", lambda email, password, tokenstore: fake_api)
+    monkeypatch.setattr(stress_core, "resolve_calendar_bytes", lambda config: _MINIMAL_ICS)
+    monkeypatch.setattr(stress_core, "sleep", lambda seconds: None)
+
+    dates = [date(2024, 1, 15), date(2024, 1, 14)]
+    config = {"email": "e", "password": "p", "tokenstore": "~/.garminconnect", "ics_path": "unused.ics"}
+
+    progress_calls = []
+    stress_core.run_bulk_analysis(
+        config, dates, on_progress=lambda i, total, d: progress_calls.append((i, total, d))
+    )
+
+    assert progress_calls == [(0, 2, date(2024, 1, 15)), (1, 2, date(2024, 1, 14))]
