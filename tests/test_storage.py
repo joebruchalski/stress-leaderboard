@@ -202,3 +202,107 @@ def test_load_person_rollup_empty_range_returns_empty_frame(db_path):
     storage.init_db(db_path)
     rollup = storage.load_person_rollup(db_path, date(2099, 1, 1), date(2099, 1, 2))
     assert rollup.empty
+
+
+# --------------------------------------------------------------------------
+# daily_recovery: save_recovery_day / load_recovery_correlation
+# --------------------------------------------------------------------------
+
+def test_save_and_load_recovery_correlation_round_trip(db_path):
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)
+    storage.init_db(db_path)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid))
+
+    storage.save_recovery_day(
+        db_path,
+        target_date,
+        {"sleep_score": 54.0, "total_sleep_minutes": 422.0},
+        {"body_battery_low": 32.0, "body_battery_high": 82.0},
+    )
+
+    correlation = storage.load_recovery_correlation(db_path, target_date, target_date)
+    assert len(correlation) == 1
+    row = correlation.iloc[0]
+    assert row["date"] == target_date.isoformat()
+    assert row["sleep_score"] == 54.0
+    assert row["total_sleep_minutes"] == 422.0
+    assert row["body_battery_low"] == 32.0
+    assert row["body_battery_high"] == 82.0
+    assert row["overall_avg"] == pytest.approx(30.0)  # daily_summary.overall_avg: mean of [10,20,40,50]
+
+
+def test_save_recovery_day_is_idempotent_on_rerun(db_path):
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)
+    storage.init_db(db_path)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid))
+
+    storage.save_recovery_day(db_path, target_date, {"sleep_score": 40.0, "total_sleep_minutes": 300.0}, None)
+    storage.save_recovery_day(db_path, target_date, {"sleep_score": 60.0, "total_sleep_minutes": 400.0}, None)
+
+    correlation = storage.load_recovery_correlation(db_path, target_date, target_date)
+    assert len(correlation) == 1  # not doubled
+    assert correlation.iloc[0]["sleep_score"] == 60.0  # latest write wins
+
+
+def test_save_recovery_day_noop_when_both_summaries_none(db_path):
+    """Nothing to store (e.g. Garmin had neither sleep nor Body Battery
+    synced for that day) must not create an all-NULL row."""
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)
+    storage.init_db(db_path)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid))
+
+    storage.save_recovery_day(db_path, target_date, None, None)
+
+    correlation = storage.load_recovery_correlation(db_path, target_date, target_date)
+    assert correlation.empty
+
+
+def test_save_recovery_day_handles_partial_data(db_path):
+    """Sleep synced but Body Battery didn't (or vice versa) — the row still
+    saves with the missing side as NULL, not dropped entirely."""
+    tz = ZoneInfo("America/New_York")
+    target_date = date(2024, 1, 15)
+    grid = _sample_grid(target_date, tz)
+    storage.init_db(db_path)
+    storage.save_day(db_path, target_date, grid, stress_core.summarize_by_event(grid))
+
+    storage.save_recovery_day(db_path, target_date, {"sleep_score": 70.0, "total_sleep_minutes": 410.0}, None)
+
+    correlation = storage.load_recovery_correlation(db_path, target_date, target_date)
+    assert len(correlation) == 1
+    row = correlation.iloc[0]
+    assert row["sleep_score"] == 70.0
+    assert pd.isna(row["body_battery_low"])
+    assert pd.isna(row["body_battery_high"])
+
+
+def test_load_recovery_correlation_only_includes_days_with_both_recovery_and_stress(db_path):
+    """Inner join semantics: a recovery row with no matching daily_summary
+    (stress never computed for that date) must not appear."""
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    # Day with both stress and recovery.
+    day1 = date(2024, 1, 15)
+    grid1 = _sample_grid(day1, tz)
+    storage.save_day(db_path, day1, grid1, stress_core.summarize_by_event(grid1))
+    storage.save_recovery_day(db_path, day1, {"sleep_score": 50.0, "total_sleep_minutes": 400.0}, None)
+
+    # Day with recovery data only (no stress ever computed/saved).
+    day2 = date(2024, 1, 16)
+    storage.save_recovery_day(db_path, day2, {"sleep_score": 80.0, "total_sleep_minutes": 450.0}, None)
+
+    correlation = storage.load_recovery_correlation(db_path, day1, day2)
+    assert list(correlation["date"]) == [day1.isoformat()]
+
+
+def test_load_recovery_correlation_empty_range_returns_empty_frame(db_path):
+    storage.init_db(db_path)
+    correlation = storage.load_recovery_correlation(db_path, date(2099, 1, 1), date(2099, 1, 2))
+    assert correlation.empty

@@ -192,6 +192,73 @@ def fetch_stress_minutes(api: garminconnect.Garmin, target_date: date, local_tz)
     return df[["timestamp_local", "stress"]]
 
 
+def fetch_sleep_summary(api: garminconnect.Garmin, target_date: date) -> dict | None:
+    """Return {"sleep_score", "total_sleep_minutes"} for target_date, or None
+    if Garmin has no sleep record for that day (or the call fails).
+
+    This is supplementary data, not the core stress fetch — unlike
+    fetch_stress_minutes(), a missing/empty/erroring result must never raise
+    and take down the rest of run_analysis().
+
+    Real response shape (inspected via a live call, not guessed): a dict with
+    top-level key "dailySleepDTO" (None/absent on a day with no synced sleep),
+    which itself has "sleepTimeSeconds" (int) and a nested
+    "sleepScores" -> "overall" -> "value" (int, 0-100, Garmin's sleep score).
+    """
+    try:
+        raw = api.get_sleep_data(target_date.isoformat())
+    except Exception:
+        return None
+
+    dto = (raw or {}).get("dailySleepDTO") or {}
+    if not dto:
+        return None
+
+    sleep_time_seconds = dto.get("sleepTimeSeconds")
+    total_sleep_minutes = (
+        sleep_time_seconds / 60 if isinstance(sleep_time_seconds, (int, float)) else None
+    )
+    overall = (dto.get("sleepScores") or {}).get("overall") or {}
+    sleep_score = overall.get("value")
+    sleep_score = float(sleep_score) if isinstance(sleep_score, (int, float)) else None
+
+    if sleep_score is None and total_sleep_minutes is None:
+        return None
+    return {"sleep_score": sleep_score, "total_sleep_minutes": total_sleep_minutes}
+
+
+def fetch_body_battery_summary(api: garminconnect.Garmin, target_date: date) -> dict | None:
+    """Return {"body_battery_low", "body_battery_high"} for target_date, or
+    None if Garmin has no Body Battery record for that day (or the call
+    fails). Supplementary data — same never-raise contract as
+    fetch_sleep_summary().
+
+    Real response shape (inspected via a live call, not guessed):
+    get_body_battery(startdate, enddate) returns a LIST of per-day dicts
+    (one per date in the range — here a single-day range still returns a
+    list), each with "bodyBatteryValuesArray": a list of
+    [timestamp_ms, bodyBatteryLevel] pairs. Low/high are derived as the
+    min/max of those levels across the day.
+    """
+    try:
+        raw = api.get_body_battery(target_date.isoformat(), target_date.isoformat())
+    except Exception:
+        return None
+
+    if not raw or not isinstance(raw, list):
+        return None
+    day = raw[0] or {}
+    values = day.get("bodyBatteryValuesArray") or []
+    levels = [
+        v[1]
+        for v in values
+        if isinstance(v, (list, tuple)) and len(v) >= 2 and isinstance(v[1], (int, float))
+    ]
+    if not levels:
+        return None
+    return {"body_battery_low": float(min(levels)), "body_battery_high": float(max(levels))}
+
+
 # --------------------------------------------------------------------------
 # Calendar
 # --------------------------------------------------------------------------
@@ -319,10 +386,17 @@ def attach_events(grid: pd.DataFrame, events: list[dict]) -> pd.DataFrame:
     return grid
 
 
-def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[dict]]:
+def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[dict], dict]:
     """End-to-end: log in, fetch stress, parse calendar, correlate. Returns
-    the minute-level grid (timestamp_local, stress, event) and the raw event
-    list (for chart shading)."""
+    the minute-level grid (timestamp_local, stress, event), the raw event
+    list (for chart shading), and a recovery dict {"sleep": ..., "body_battery": ...}
+    (each value is a fetch_*_summary() dict or None — sleep/Body Battery are
+    supplementary and must never fail the core stress/calendar analysis).
+
+    Adds a third return value vs. the original (grid, events) signature —
+    existing callers that only unpack two values need updating; this is a
+    deliberate, visible break rather than a silent dict bolted onto one of
+    the existing items."""
     local_tz = get_localzone()
     api = garmin_login(config["email"], config["password"], config["tokenstore"])
     stress_df = fetch_stress_minutes(api, target_date, local_tz)
@@ -333,7 +407,12 @@ def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[di
     grid = build_minute_grid(target_date, local_tz)
     grid = attach_stress(grid, stress_df)
     grid = attach_events(grid, events)
-    return grid, events
+
+    recovery = {
+        "sleep": fetch_sleep_summary(api, target_date),
+        "body_battery": fetch_body_battery_summary(api, target_date),
+    }
+    return grid, events, recovery
 
 
 # --------------------------------------------------------------------------
@@ -465,6 +544,34 @@ def build_person_rollup_chart(rollup: pd.DataFrame) -> plt.Figure:
     ax.set_xlabel("Average stress level (0-100)")
     ax.set_title("Average Stress by Meeting Attendee")
     ax.grid(axis="x", color="#e1e0d9", linewidth=0.8, zorder=0)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+def build_recovery_scatter_chart(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> plt.Figure:
+    """Scatter one dot per day: x = a recovery metric (sleep score or Body
+    Battery), y = that day's average workday stress. Deliberately a single
+    scatter with one axis, not a dual-axis (two y-scales) chart — dual-axis
+    is the #1 chart mistake for exactly this "does X predict Y" question, per
+    the dataviz skill. `df` must have columns [x_col, "overall_avg"], already
+    dropna'd of rows missing either value (see load_recovery_correlation)."""
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(
+        df[x_col],
+        df["overall_avg"],
+        color=STRESS_LINE_COLOR,
+        s=36,
+        alpha=0.75,
+        edgecolors="none",
+    )
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Workday average stress (0-100)")
+    ax.set_ylim(0, 100)
+    ax.set_title(title)
+    ax.grid(color="#e1e0d9", linewidth=0.8, zorder=0)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()

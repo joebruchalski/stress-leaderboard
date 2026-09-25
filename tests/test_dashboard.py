@@ -43,9 +43,9 @@ def test_dashboard_empty_state_renders_without_exceptions(monkeypatch, tmp_path,
     at.run(timeout=60)
 
     assert not at.exception
-    assert [t.label for t in at.tabs] == ["Daily Detail", "Trends", "By Person"]
+    assert [t.label for t in at.tabs] == ["Daily Detail", "Trends", "By Person", "Recovery"]
 
-    # Empty DB: all three tabs should show an informational empty state, not
+    # Empty DB: all four tabs should show an informational empty state, not
     # crash or show stale/wrong data.
     daily_info = " ".join(i.value for i in at.tabs[0].info)
     assert "No stored results" in daily_info or "Fetch from Garmin" in daily_info
@@ -55,6 +55,9 @@ def test_dashboard_empty_state_renders_without_exceptions(monkeypatch, tmp_path,
 
     people_info = " ".join(i.value for i in at.tabs[2].info)
     assert "No attendee data" in people_info
+
+    recovery_info = " ".join(i.value for i in at.tabs[3].info)
+    assert "No sleep/Body Battery data" in recovery_info
 
 
 def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_path, fixtures_dir):
@@ -115,6 +118,66 @@ def test_dashboard_populated_state_renders_without_exceptions(monkeypatch, tmp_p
     assert len(people_tab.dataframe) == 1
     rendered = str(people_tab.dataframe[0].value)
     assert "Alice Anderson" in rendered and "Bob Brown" in rendered
+
+
+def test_dashboard_recovery_tab_renders_scatter_charts_when_populated(monkeypatch, tmp_path, fixtures_dir):
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    for offset, sleep_score, bb_high in [(1, 40.0, 60.0), (0, 85.0, 95.0)]:
+        day = date.today() - timedelta(days=offset)
+        timestamps = pd.date_range(
+            datetime.combine(day, time(9, 0), tzinfo=tz),
+            datetime.combine(day, time(9, 2), tzinfo=tz),
+            freq="1min",
+        )
+        grid = pd.DataFrame({"timestamp_local": timestamps, "stress": [50.0, 60.0, 70.0], "event": ["Standup"] * 3})
+        storage.save_day(db_path, day, grid, stress_core.summarize_by_event(grid))
+        storage.save_recovery_day(
+            db_path,
+            day,
+            {"sleep_score": sleep_score, "total_sleep_minutes": 400.0},
+            {"body_battery_low": 20.0, "body_battery_high": bb_high},
+        )
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    recovery_tab = at.tabs[3]
+    assert len(recovery_tab.info) == 0  # populated, not the empty state
+    # st.pyplot() renders as an Image element in AppTest's element tree.
+    assert len(recovery_tab.image) == 2  # sleep-score scatter + Body Battery scatter
+    assert len(recovery_tab.dataframe) == 1  # the day-by-day table
+
+
+def test_dashboard_recovery_tab_partial_data_shows_info_not_exception(monkeypatch, tmp_path, fixtures_dir):
+    """A day with only sleep data (no Body Battery) must still render the
+    sleep chart and an info message for the missing Body Battery chart,
+    never an uncaught exception."""
+    db_path = _isolate_dashboard_env(monkeypatch, tmp_path, fixtures_dir)
+    tz = ZoneInfo("America/New_York")
+    storage.init_db(db_path)
+
+    today = date.today()
+    timestamps = pd.date_range(
+        datetime.combine(today, time(9, 0), tzinfo=tz),
+        datetime.combine(today, time(9, 2), tzinfo=tz),
+        freq="1min",
+    )
+    grid = pd.DataFrame({"timestamp_local": timestamps, "stress": [50.0, 60.0, 70.0], "event": ["Standup"] * 3})
+    storage.save_day(db_path, today, grid, stress_core.summarize_by_event(grid))
+    storage.save_recovery_day(db_path, today, {"sleep_score": 65.0, "total_sleep_minutes": 400.0}, None)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=60)
+
+    assert not at.exception
+    recovery_tab = at.tabs[3]
+    assert len(recovery_tab.image) == 1  # only the sleep-score chart
+    battery_info = " ".join(i.value for i in recovery_tab.info)
+    assert "No overlapping Body Battery" in battery_info
 
 
 def test_dashboard_people_tab_slider_filters_by_meeting_count(monkeypatch, tmp_path, fixtures_dir):

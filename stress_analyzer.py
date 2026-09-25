@@ -129,7 +129,7 @@ def main() -> None:
         )
 
     try:
-        grid, events = stress_core.run_analysis(config, args.date)
+        grid, events, recovery = stress_core.run_analysis(config, args.date)
     except (ConfigError, ValueError) as exc:
         sys.exit(str(exc))
 
@@ -138,6 +138,7 @@ def main() -> None:
     storage.init_db(args.db)
     event_summary = stress_core.summarize_by_event(grid)
     storage.save_day(args.db, args.date, grid, event_summary, events)
+    storage.save_recovery_day(args.db, args.date, recovery["sleep"], recovery["body_battery"])
     print(f"\nResults saved to: {args.db}")
 
     output_path = args.output or Path(f"stress_report_{args.date.isoformat()}.png")
