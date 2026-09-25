@@ -156,11 +156,25 @@ def test_attach_events_overlap_first_started_wins(local_tz):
 # --------------------------------------------------------------------------
 
 class _FakeGarminApi:
-    def __init__(self, values):
+    def __init__(self, values, sleep_response=None, body_battery_response=None, raise_on_sleep=False, raise_on_body_battery=False):
         self._values = values
+        self._sleep_response = sleep_response
+        self._body_battery_response = body_battery_response
+        self._raise_on_sleep = raise_on_sleep
+        self._raise_on_body_battery = raise_on_body_battery
 
     def get_stress_data(self, date_str):
         return {"stressValuesArray": self._values}
+
+    def get_sleep_data(self, cdate):
+        if self._raise_on_sleep:
+            raise RuntimeError("simulated Garmin failure")
+        return self._sleep_response
+
+    def get_body_battery(self, startdate, enddate=None):
+        if self._raise_on_body_battery:
+            raise RuntimeError("simulated Garmin failure")
+        return self._body_battery_response
 
 
 def test_fetch_stress_minutes_converts_invalid_sentinels_to_nan(local_tz):
@@ -186,6 +200,93 @@ def test_fetch_stress_minutes_raises_when_no_data(local_tz):
     api = _FakeGarminApi([])
     with pytest.raises(ValueError):
         stress_core.fetch_stress_minutes(api, date(2024, 1, 15), local_tz)
+
+
+# --------------------------------------------------------------------------
+# fetch_sleep_summary / fetch_body_battery_summary: real-shaped responses,
+# observed via a live call against get_sleep_data("2026-09-21") and
+# get_body_battery("2026-09-21", "2026-09-21") — not guessed. Both must be
+# resilient (return None, never raise) on missing/empty/erroring data, since
+# this is supplementary data that must not crash the core stress analysis.
+# --------------------------------------------------------------------------
+
+REAL_SHAPED_SLEEP_RESPONSE = {
+    "dailySleepDTO": {
+        "calendarDate": "2026-09-21",
+        "sleepTimeSeconds": 25320,
+        "deepSleepSeconds": 1860,
+        "lightSleepSeconds": 20340,
+        "remSleepSeconds": 3120,
+        "awakeSleepSeconds": 3840,
+        "avgSleepStress": 21.0,
+        "sleepScores": {
+            "overall": {"value": 54, "qualifierKey": "POOR"},
+        },
+    },
+    "sleepMovement": [],
+}
+
+REAL_SHAPED_BODY_BATTERY_RESPONSE = [
+    {
+        "date": "2026-09-21",
+        "charged": 77,
+        "drained": 52,
+        "bodyBatteryValuesArray": [
+            [1789964820000, 32],
+            [1789991460000, 75],
+            [1789995600000, 82],
+            [1790019180000, 55],
+            [1790035200000, 32],
+            [1790049420000, 59],
+        ],
+    }
+]
+
+
+def test_fetch_sleep_summary_parses_real_shaped_response():
+    api = _FakeGarminApi([], sleep_response=REAL_SHAPED_SLEEP_RESPONSE)
+    result = stress_core.fetch_sleep_summary(api, date(2026, 9, 21))
+    assert result == {"sleep_score": 54.0, "total_sleep_minutes": pytest.approx(422.0)}
+
+
+def test_fetch_sleep_summary_returns_none_when_no_dto():
+    api = _FakeGarminApi([], sleep_response={"dailySleepDTO": None})
+    assert stress_core.fetch_sleep_summary(api, date(2026, 9, 21)) is None
+
+    api_empty = _FakeGarminApi([], sleep_response={})
+    assert stress_core.fetch_sleep_summary(api_empty, date(2026, 9, 21)) is None
+
+    api_none = _FakeGarminApi([], sleep_response=None)
+    assert stress_core.fetch_sleep_summary(api_none, date(2026, 9, 21)) is None
+
+
+def test_fetch_sleep_summary_returns_none_instead_of_raising_on_error():
+    api = _FakeGarminApi([], raise_on_sleep=True)
+    assert stress_core.fetch_sleep_summary(api, date(2026, 9, 21)) is None
+
+
+def test_fetch_body_battery_summary_parses_real_shaped_response():
+    api = _FakeGarminApi([], body_battery_response=REAL_SHAPED_BODY_BATTERY_RESPONSE)
+    result = stress_core.fetch_body_battery_summary(api, date(2026, 9, 21))
+    assert result == {"body_battery_low": 32.0, "body_battery_high": 82.0}
+
+
+def test_fetch_body_battery_summary_returns_none_when_empty():
+    api = _FakeGarminApi([], body_battery_response=[])
+    assert stress_core.fetch_body_battery_summary(api, date(2026, 9, 21)) is None
+
+    api_no_values = _FakeGarminApi(
+        [], body_battery_response=[{"date": "2026-09-21", "bodyBatteryValuesArray": []}]
+    )
+    assert stress_core.fetch_body_battery_summary(api_no_values, date(2026, 9, 21)) is None
+
+    api_none = _FakeGarminApi([], body_battery_response=None)
+    assert stress_core.fetch_body_battery_summary(api_none, date(2026, 9, 21)) is None
+
+
+def test_fetch_body_battery_summary_returns_none_instead_of_raising_on_error():
+    api = _FakeGarminApi([], raise_on_body_battery=True)
+    assert stress_core.fetch_body_battery_summary(api, date(2026, 9, 21)) is None
 
 
 # --------------------------------------------------------------------------

@@ -135,12 +135,13 @@ def run_single_day(config: dict, target_date: date, db_path: str, output_path: P
     save a PNG chart. Raises ConfigError/ValueError on failure — the caller
     decides whether that's fatal (single-day mode) or just skip-and-continue
     (backfill mode)."""
-    grid, events = stress_core.run_analysis(config, target_date)
+    grid, events, recovery = stress_core.run_analysis(config, target_date)
     print(stress_core.format_summary_text(grid, target_date))
 
     storage.init_db(db_path)
     event_summary = stress_core.summarize_by_event(grid)
     storage.save_day(db_path, target_date, grid, event_summary, events)
+    storage.save_recovery_day(db_path, target_date, recovery["sleep"], recovery["body_battery"])
     print(f"\nResults saved to: {db_path}")
 
     if save_chart:

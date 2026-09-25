@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS event_attendees (
     attendee_name TEXT NOT NULL,
     PRIMARY KEY (date, event, attendee_email)
 );
+
+CREATE TABLE IF NOT EXISTS daily_recovery (
+    date TEXT PRIMARY KEY,
+    sleep_score REAL,
+    total_sleep_minutes REAL,
+    body_battery_low REAL,
+    body_battery_high REAL,
+    computed_at TEXT NOT NULL
+);
 """
 
 
@@ -126,6 +135,62 @@ def save_day(
                 "INSERT OR IGNORE INTO event_attendees (date, event, attendee_email, attendee_name) VALUES (?, ?, ?, ?)",
                 attendee_rows,
             )
+
+
+def save_recovery_day(
+    db_path: str,
+    target_date: date,
+    sleep_summary: dict | None,
+    body_battery_summary: dict | None,
+) -> None:
+    """Persist one day's sleep/Body Battery summary (each may independently
+    be None — supplementary data, not every day has both synced). No-op if
+    both are None, so a day with neither never gets a row of all-NULL
+    metrics sitting in the table."""
+    if sleep_summary is None and body_battery_summary is None:
+        return
+
+    sleep_summary = sleep_summary or {}
+    body_battery_summary = body_battery_summary or {}
+    date_str = target_date.isoformat()
+
+    with _connect(db_path) as conn:
+        conn.executescript(SCHEMA)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO daily_recovery
+                (date, sleep_score, total_sleep_minutes, body_battery_low, body_battery_high, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                date_str,
+                sleep_summary.get("sleep_score"),
+                sleep_summary.get("total_sleep_minutes"),
+                body_battery_summary.get("body_battery_low"),
+                body_battery_summary.get("body_battery_high"),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+
+
+def load_recovery_correlation(db_path: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Join daily_recovery with daily_summary by date, for the "does bad
+    sleep predict worse meeting-stress days" question. Inner join: a day only
+    contributes to the correlation if it has both a recovery record and a
+    computed stress average."""
+    with _connect(db_path) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT r.date, r.sleep_score, r.total_sleep_minutes,
+                   r.body_battery_low, r.body_battery_high, s.overall_avg
+            FROM daily_recovery r
+            JOIN daily_summary s ON r.date = s.date
+            WHERE r.date BETWEEN ? AND ?
+            ORDER BY r.date
+            """,
+            conn,
+            params=(start_date.isoformat(), end_date.isoformat()),
+        )
 
 
 def load_day_grid(db_path: str, target_date: date) -> pd.DataFrame:

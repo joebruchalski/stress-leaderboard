@@ -86,7 +86,7 @@ def render_daily_tab(config: dict, db_path: str) -> None:
             return
         with st.spinner(f"Logging into Garmin and correlating {target_date.isoformat()}…"):
             try:
-                grid, events = stress_core.run_analysis(config, target_date)
+                grid, events, recovery = stress_core.run_analysis(config, target_date)
             except (stress_core.ConfigError, ValueError) as exc:
                 st.error(str(exc))
                 return
@@ -96,6 +96,7 @@ def render_daily_tab(config: dict, db_path: str) -> None:
             event_summary = stress_core.summarize_by_event(grid)
             storage.init_db(db_path)
             storage.save_day(db_path, target_date, grid, event_summary, events)
+            storage.save_recovery_day(db_path, target_date, recovery["sleep"], recovery["body_battery"])
         st.success("Done.")
         has_cached = True
 
@@ -238,13 +239,85 @@ def render_patterns_tab(db_path: str) -> None:
         st.pyplot(fig, width="stretch")
 
 
+def render_recovery_tab(db_path: str) -> None:
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("From", value=date.today() - timedelta(days=13), key="recovery_start")
+    with col2:
+        end_date = st.date_input("To", value=date.today(), key="recovery_end")
+
+    if start_date > end_date:
+        st.error("Start date must be before end date.")
+        return
+
+    try:
+        correlation = storage.load_recovery_correlation(db_path, start_date, end_date)
+    except Exception as exc:  # noqa: BLE001 - never let a query error crash the tab
+        st.error(f"Could not load recovery data: {exc}")
+        return
+
+    if correlation.empty:
+        st.info(
+            "No sleep/Body Battery data stored for this range yet. Run an analysis "
+            "(Daily Detail tab, or the automated job) on a day with synced Garmin sleep data first."
+        )
+        return
+
+    st.caption(
+        "Each dot is one day: does a worse night's sleep or a lower Body Battery line up "
+        "with a higher-stress workday?"
+    )
+
+    sleep_df = correlation.dropna(subset=["sleep_score", "overall_avg"])
+    col_sleep, col_battery = st.columns(2)
+
+    with col_sleep:
+        if sleep_df.empty:
+            st.info("No overlapping sleep score + stress data in this range.")
+        else:
+            fig = stress_core.build_recovery_scatter_chart(
+                sleep_df, "sleep_score", "Sleep score (0-100)", "Sleep Score vs. Workday Stress"
+            )
+            st.pyplot(fig, width="stretch")
+
+    battery_df = correlation.dropna(subset=["body_battery_high", "overall_avg"])
+    with col_battery:
+        if battery_df.empty:
+            st.info("No overlapping Body Battery + stress data in this range.")
+        else:
+            fig = stress_core.build_recovery_scatter_chart(
+                battery_df,
+                "body_battery_high",
+                "Body Battery, morning high (0-100)",
+                "Body Battery vs. Workday Stress",
+            )
+            st.pyplot(fig, width="stretch")
+
+    st.subheader("Recovery and stress by day")
+    st.dataframe(
+        correlation.style.format(
+            {
+                "sleep_score": "{:.0f}",
+                "total_sleep_minutes": "{:.0f}",
+                "body_battery_low": "{:.0f}",
+                "body_battery_high": "{:.0f}",
+                "overall_avg": "{:.1f}",
+            },
+            na_rep="-",
+        ),
+        width="stretch",
+    )
+
+
 def main() -> None:
     st.title("Stress vs. Calendar")
     config = render_settings_sidebar()
     db_path = stress_core.DEFAULT_DB_PATH
     storage.init_db(db_path)
 
-    tab_daily, tab_trends, tab_people, tab_patterns = st.tabs(["Daily Detail", "Trends", "By Person", "Patterns"])
+    tab_daily, tab_trends, tab_people, tab_patterns, tab_recovery = st.tabs(
+        ["Daily Detail", "Trends", "By Person", "Patterns", "Recovery"]
+    )
     with tab_daily:
         render_daily_tab(config, db_path)
     with tab_trends:
@@ -253,6 +326,8 @@ def main() -> None:
         render_people_tab(db_path)
     with tab_patterns:
         render_patterns_tab(db_path)
+    with tab_recovery:
+        render_recovery_tab(db_path)
 
 
 if __name__ == "__main__":
