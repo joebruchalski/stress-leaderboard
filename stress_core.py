@@ -24,6 +24,7 @@ from tzlocal import get_localzone
 WORKDAY_START = time(9, 0)
 WORKDAY_END = time(17, 0)
 INVALID_STRESS_VALUES = {-1, -2}
+BASELINE_MINUTES = 15  # "before" window for compute_meeting_deltas()
 
 CONFIG_DIR = Path.home() / ".config" / "stress_analyzer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -317,6 +318,81 @@ def attach_events(grid: pd.DataFrame, events: list[dict]) -> pd.DataFrame:
         grid.loc[mask, "event"] = event["title"]
     grid["event"] = grid["event"].fillna("No Meeting")
     return grid
+
+
+def compute_meeting_deltas(
+    grid: pd.DataFrame, events: list[dict], baseline_minutes: int = BASELINE_MINUTES
+) -> pd.DataFrame:
+    """Before-vs-during stress delta per event — a more causal signal than a
+    flat during-meeting average: did stress actually rise when the meeting
+    started, relative to genuinely free time right before it?
+
+    For each event occurrence, the baseline is the `baseline_minutes`
+    immediately before its start. That baseline only counts if every one of
+    those minutes (a) falls inside the minute grid (e.g. not before 9:00 AM)
+    and (b) is labeled "No Meeting" in the grid — i.e. real free time, not
+    spillover from a back-to-back prior meeting. If the baseline window
+    isn't fully available, or either the baseline or during-meeting window
+    ends up with no valid stress readings, that occurrence's delta is NaN
+    rather than a number fabricated from insufficient data.
+
+        delta = during-meeting avg valid stress - baseline avg valid stress
+
+    (same "average of valid readings" definition summarize_by_event() uses).
+    The during-meeting window is additionally restricted to minutes the grid
+    actually attributes to this event's title (attach_events() resolves
+    overlaps first-started-wins, so a later overlapping event may not own
+    every minute inside its own start/end span).
+
+    A title with multiple occurrences in `events` (e.g. a recurring meeting
+    that happens twice the same day) collapses to one row: the mean of its
+    occurrences' deltas, NaN occurrences excluded (all-NaN occurrences ->
+    NaN for the title, not a dropped row — so callers can left-join this
+    onto summarize_by_event()'s output without losing rows).
+
+    Pure function, no Garmin/DB dependency. Returns a DataFrame indexed by
+    event title ("event") with a single delta_stress column.
+    """
+    if grid.empty or not events:
+        return pd.DataFrame({"delta_stress": pd.Series(dtype="float64")}).rename_axis("event")
+
+    grid = grid.sort_values("timestamp_local").reset_index(drop=True)
+    grid_start = grid["timestamp_local"].iloc[0]
+
+    occurrence_deltas: dict[str, list[float]] = {}
+    for event in events:
+        title = event["title"]
+        start = pd.Timestamp(event["start"])
+        end = pd.Timestamp(event["end"])
+        baseline_start = start - pd.Timedelta(minutes=baseline_minutes)
+
+        delta = float("nan")
+        if baseline_start >= grid_start:
+            baseline_mask = (grid["timestamp_local"] >= baseline_start) & (grid["timestamp_local"] < start)
+            baseline_rows = grid.loc[baseline_mask]
+            baseline_is_free = (
+                len(baseline_rows) >= baseline_minutes and (baseline_rows["event"] == "No Meeting").all()
+            )
+            if baseline_is_free:
+                baseline_valid = baseline_rows.dropna(subset=["stress"])
+                during_mask = (
+                    (grid["timestamp_local"] >= start)
+                    & (grid["timestamp_local"] < end)
+                    & (grid["event"] == title)
+                )
+                during_valid = grid.loc[during_mask].dropna(subset=["stress"])
+                if not baseline_valid.empty and not during_valid.empty:
+                    delta = during_valid["stress"].mean() - baseline_valid["stress"].mean()
+
+        occurrence_deltas.setdefault(title, []).append(delta)
+
+    rows = []
+    for title, deltas in occurrence_deltas.items():
+        valid = [d for d in deltas if not pd.isna(d)]
+        avg_delta = (sum(valid) / len(valid)) if valid else float("nan")
+        rows.append({"event": title, "delta_stress": avg_delta})
+
+    return pd.DataFrame(rows).set_index("event")
 
 
 def run_analysis(config: dict, target_date: date) -> tuple[pd.DataFrame, list[dict]]:

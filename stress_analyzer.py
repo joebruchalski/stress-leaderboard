@@ -137,6 +137,8 @@ def main() -> None:
 
     storage.init_db(args.db)
     event_summary = stress_core.summarize_by_event(grid)
+    deltas = stress_core.compute_meeting_deltas(grid, events)
+    event_summary = event_summary.join(deltas)
     storage.save_day(args.db, args.date, grid, event_summary, events)
     print(f"\nResults saved to: {args.db}")
 
