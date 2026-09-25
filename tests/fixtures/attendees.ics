@@ -1,0 +1,18 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+CALSCALE:GREGORIAN
+BEGIN:VEVENT
+UID:attendees-event-1@test
+DTSTAMP:20240101T000000Z
+DTSTART:20240115T140000Z
+DTEND:20240115T150000Z
+SUMMARY:Team Sync
+ORGANIZER;CN=Me Myself:mailto:me@example.com
+ATTENDEE;CUTYPE=INDIVIDUAL;CN=Alice Anderson:mailto:alice@example.com
+ATTENDEE;CUTYPE=INDIVIDUAL;CN=bob@example.com:mailto:bob@example.com
+ATTENDEE;CUTYPE=INDIVIDUAL;CN=Me Myself:mailto:me@example.com
+ATTENDEE;CUTYPE=ROOM;CN=Conference Room A:mailto:room-a@example.com
+ATTENDEE;CUTYPE=INDIVIDUAL;CN=Alice Anderson:mailto:alice@example.com
+END:VEVENT
+END:VCALENDAR

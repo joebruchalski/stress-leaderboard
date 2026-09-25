@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.joebruchalski.stressanalyzer</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/joebruchalski/projects/.venv/bin/python3</string>
+        <string>/Users/joebruchalski/projects/stress_analyzer.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/joebruchalski/projects</string>
+
+    <!-- Runs daily at 6:30 PM, after a typical workday ends. Change Hour/Minute
+         below and reload the job (see instructions) to pick a different time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>18</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/joebruchalski/Library/Logs/stress_analyzer.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/joebruchalski/Library/Logs/stress_analyzer.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
