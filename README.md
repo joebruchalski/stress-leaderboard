@@ -11,12 +11,12 @@ Everything runs locally: your Garmin password lives only in the macOS Keychain, 
 ```bash
 git clone https://github.com/joebruchalski/stress-leaderboard.git
 cd stress-leaderboard
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run dashboard.py
+./setup.sh
 ```
 
-The first run will prompt you for your Garmin Connect email/password (password goes straight to the macOS Keychain) and a calendar `.ics` file or private iCal URL — see [Configure](#2-configure) for details. Prefer the newer React UI instead of Streamlit? See [Setup](#setup) below.
+`setup.sh` creates the virtualenv, installs dependencies, and launches the Streamlit dashboard — safe to re-run any time. The first run will prompt you for your Garmin Connect email/password (password goes straight to the macOS Keychain) and a calendar `.ics` file or private iCal URL — see [Configure](#2-configure) for details.
+
+Prefer to run the steps yourself, or want the newer React UI instead of Streamlit? See [Setup](#setup) below.
 
 ## Features
 
