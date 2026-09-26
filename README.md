@@ -4,6 +4,20 @@ Correlates your [Garmin Connect](https://connect.garmin.com/) stress/Body Batter
 
 Everything runs locally: your Garmin password lives only in the macOS Keychain, and computed history is stored in a local SQLite database. Nothing is sent anywhere except to Garmin's own API and your calendar provider, to fetch your own data.
 
+> **This is source code, not a hosted app.** Nothing runs on GitHub — to use it, you clone it and run it on your own Mac with your own Garmin account and calendar. See [Quick Start](#quick-start) below.
+
+## Quick Start
+
+```bash
+git clone https://github.com/joebruchalski/stress-leaderboard.git
+cd stress-leaderboard
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run dashboard.py
+```
+
+The first run will prompt you for your Garmin Connect email/password (password goes straight to the macOS Keychain) and a calendar `.ics` file or private iCal URL — see [Configure](#2-configure) for details. Prefer the newer React UI instead of Streamlit? See [Setup](#setup) below.
+
 ## Features
 
 - **Leaderboard** — ranks the people you meet with by average stress impact, so you can see who (and what recurring meetings) correlate with your stress spiking
