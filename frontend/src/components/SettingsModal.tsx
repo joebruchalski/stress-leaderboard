@@ -48,8 +48,8 @@ export default function SettingsModal({ config, onClose, onSaved }: SettingsModa
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    if (!email || !icsPath) {
-      setError('Email and .ics path are required.')
+    if (!email || (!icsPath && !icsUrl.trim())) {
+      setError('Email and either a .ics path or a live calendar URL are required.')
       setSuccess(null)
       return
     }
@@ -158,7 +158,9 @@ export default function SettingsModal({ config, onClose, onSaved }: SettingsModa
         {error && <Callout variant="error">{error}</Callout>}
         {success && <Callout variant="success">{success}</Callout>}
         {!config.ready && !success && (
-          <Callout variant="warning">Fill in your Garmin email, password, and .ics path to run analyses.</Callout>
+          <Callout variant="warning">
+            Fill in your Garmin email, password, and a .ics path or live calendar URL to run analyses.
+          </Callout>
         )}
       </div>
     </div>

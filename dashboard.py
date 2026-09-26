@@ -37,7 +37,7 @@ def render_settings_popover() -> dict:
     app that needs sidebar navigation, so a full-height sidebar was just
     wasted screen width."""
     config = stress_core.resolve_config()
-    missing = not (config["email"] and config["ics_path"] and config["password"])
+    missing = not (config["email"] and (config["ics_path"] or config.get("ics_url")) and config["password"])
 
     with st.popover(("⚠️" if missing else "⋮"), help="Settings"):
         with st.form("settings_form", clear_on_submit=False):
@@ -71,14 +71,14 @@ def render_settings_popover() -> dict:
             submitted = st.form_submit_button("Save settings")
 
         if submitted:
-            if not email or not ics_path:
-                st.error("Email and .ics path are required.")
-            elif not Path(ics_path).expanduser().is_file():
+            if not email or not (ics_path or ics_url.strip()):
+                st.error("Email and either a .ics path or a live calendar URL are required.")
+            elif ics_path and not Path(ics_path).expanduser().is_file():
                 st.error(f"File not found: {ics_path}")
             else:
                 stress_core.save_config(
                     email,
-                    str(Path(ics_path).expanduser()),
+                    str(Path(ics_path).expanduser()) if ics_path else "",
                     config["tokenstore"],
                     calendar_email,
                     internal_domain,
@@ -92,7 +92,7 @@ def render_settings_popover() -> dict:
                 config = stress_core.resolve_config()
 
         if missing and not submitted:
-            st.warning("Fill in your Garmin email, password, and .ics path to run analyses.")
+            st.warning("Fill in your Garmin email, password, and a .ics path or live calendar URL to run analyses.")
 
     return config
 
@@ -144,7 +144,7 @@ def render_daily_tab(config: dict, db_path: str) -> None:
             type="primary" if not has_cached else "secondary",
         )
 
-    ready = config["email"] and config["ics_path"] and config["password"]
+    ready = config["email"] and (config["ics_path"] or config.get("ics_url")) and config["password"]
 
     if force_refresh:
         if not ready:
@@ -647,7 +647,7 @@ def render_backfill_control(config: dict, db_path: str) -> None:
         if not start_clicked:
             return
 
-        ready = config["email"] and config["ics_path"] and config["password"]
+        ready = config["email"] and (config["ics_path"] or config.get("ics_url")) and config["password"]
         if not ready:
             st.error("Fill in Settings (top right) first.")
             return

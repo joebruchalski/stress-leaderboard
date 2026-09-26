@@ -102,7 +102,7 @@ def _config_response(config: dict) -> dict:
         "internal_domain": config["internal_domain"],
         "tokenstore": config["tokenstore"],
         "has_password": bool(config["password"]),
-        "ready": bool(config["email"] and config["ics_path"] and config["password"]),
+        "ready": bool(config["email"] and (config["ics_path"] or config.get("ics_url")) and config["password"]),
     }
 
 
@@ -122,19 +122,20 @@ def get_config() -> dict:
 
 @app.post("/api/config")
 def post_config(body: ConfigUpdate) -> dict:
-    if not body.email or not body.ics_path:
-        raise HTTPException(status_code=400, detail="Email and .ics path are required.")
-    if not Path(body.ics_path).expanduser().is_file():
+    ics_url = body.ics_url.strip()
+    if not body.email or not (body.ics_path or ics_url):
+        raise HTTPException(status_code=400, detail="Email and either a .ics path or a live calendar URL are required.")
+    if body.ics_path and not Path(body.ics_path).expanduser().is_file():
         raise HTTPException(status_code=400, detail=f"File not found: {body.ics_path}")
 
     current = stress_core.resolve_config()
     stress_core.save_config(
         body.email,
-        str(Path(body.ics_path).expanduser()),
+        str(Path(body.ics_path).expanduser()) if body.ics_path else "",
         current["tokenstore"],
         body.calendar_email,
         body.internal_domain,
-        body.ics_url.strip(),
+        ics_url,
     )
     if body.password:
         stress_core.save_keychain_password(body.email, body.password)
@@ -423,7 +424,7 @@ class BackfillRequest(BaseModel):
 @app.post("/api/backfill")
 def post_backfill(body: BackfillRequest) -> dict:
     config = stress_core.resolve_config()
-    ready = bool(config["email"] and config["ics_path"] and config["password"])
+    ready = bool(config["email"] and (config["ics_path"] or config.get("ics_url")) and config["password"])
     if not ready:
         raise HTTPException(status_code=400, detail="Fill in Settings first.")
 
