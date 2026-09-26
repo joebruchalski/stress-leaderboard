@@ -19,7 +19,16 @@ import streamlit as st
 import storage
 import stress_core
 
-st.set_page_config(page_title="Stress vs. Calendar", layout="wide")
+st.set_page_config(
+    page_title="Stress vs. Calendar",
+    layout="wide",
+    menu_items={
+        "About": (
+            "**Settings** (Garmin login, calendar path, own email, etc.) live in the "
+            "⋮ / ⚠️ icon next to the page title, top-right of the app — not in this menu."
+        )
+    },
+)
 
 
 def render_settings_popover() -> dict:

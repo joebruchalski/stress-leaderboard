@@ -7,12 +7,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/joebruchalski/projects/.venv/bin/python3</string>
-        <string>/Users/joebruchalski/projects/stress_analyzer.py</string>
+        <string>/Users/joebruchalski/projects/pissed/.venv/bin/python3</string>
+        <string>/Users/joebruchalski/projects/pissed/stress_analyzer.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/joebruchalski/projects</string>
+    <string>/Users/joebruchalski/projects/pissed</string>
 
     <!-- Runs daily at 6:30 PM, after a typical workday ends. Change Hour/Minute
          below and reload the job (see instructions) to pick a different time. -->
